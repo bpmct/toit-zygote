@@ -46,24 +46,6 @@ INDEX ::= """
 <html>
 """
 
-// Add a simple success page HTML
-SUCCESS_PAGE ::= """
-<html>
-  <head>
-    <title>WiFi Setup Complete</title>
-    <style>
-      body { font-family: Arial, sans-serif; margin: 40px; text-align: center; }
-      h1 { color: #4CAF50; }
-    </style>
-  </head>
-  <body>
-    <h1>WiFi Setup Complete</h1>
-    <p>Connecting to network: <strong>{{ssid}}</strong></p>
-    <p>The device will restart if the connection is successful.</p>
-  </body>
-</html>
-"""
-
 main:
   // We should only run when the device is in setup mode (RUNNING is false)
   if mode.RUNNING: return
@@ -157,25 +139,13 @@ handle_http_request request/http.Request writer/http.ResponseWriter access_point
     writer.write "Not found: $resource"
     return null
 
-  // If there are query parameters, this is likely a submission
-  if not query.parameters.is_empty:
-    ssid := query.parameters["ssid"].trim
-    password := query.parameters["password"].trim
-    
-    if ssid != "" and password != "":
-      // Show success page
-      substitutions := { "ssid": ssid }
-      writer.headers.set "Content-Type" "text/html"
-      writer.write (SUCCESS_PAGE.substitute: substitutions[it])
-      
-      // Return the credentials
-      return { "ssid": ssid, "password": password }
-
-  // Show the main form
   substitutions := {
     "access-points": (access_points.map: "$it.ssid<br>").join "\n"
   }
   writer.headers.set "Content-Type" "text/html"
   writer.write (INDEX.substitute: substitutions[it])
-  
-  return null
+
+  if query.parameters.is_empty: return null
+  ssid := query.parameters["ssid"].trim
+  password := query.parameters["password"].trim
+  return { "ssid": ssid, "password": password }
