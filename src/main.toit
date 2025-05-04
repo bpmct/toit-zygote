@@ -44,6 +44,11 @@ run network/net.Interface:
   tags/Map? := null
   if mode.DEVELOPMENT: tags = {"mode": "development"}
 
+  // Print connection information
+  log.info "WiFi connected successfully" --tags={
+    "address": network.address
+  }
+
   while true:
     log.info "running" --tags=tags
     result := ntp.synchronize --network=network
