@@ -21,22 +21,22 @@ import .mode as mode
 CAPTIVE_PORTAL_SSID     ::= "mywifi"
 CAPTIVE_PORTAL_PASSWORD ::= "12345678"
 
-// Captive portal detection endpoints we handle:
-// - iOS: /hotspot-detect.html, /success.html, /library/test/success.html
-// - Android: /generate_204, /gen_204, /ncsi.txt
-// - Windows: /connecttest.txt, /ncsi.txt
-// - Samsung: /mobile/status.php
-// - ChromeOS: /generate_204
-//
-// We handle all of these directly with appropriate responses in both
-// our direct HTTP handler and the main HTTP server.
-TEMPORARY_REDIRECTS ::= {
-  // Other useful redirects can be added here
-  "success": "/index.html",
-}
+//-------------------------------------------------------------------------
+// Platform-specific captive portal detection handling
+//-------------------------------------------------------------------------
 
-// Success response used for iOS detection
-DIRECT_SUCCESS_RESPONSE ::= """HTTP/1.1 200 OK
+// ----- iOS CAPTIVE PORTAL DETECTION -----
+// 
+// iOS captive portal detection specifically looks for this exact
+// format for the success response with these exact headers.
+// 
+// Detection endpoints: 
+// - /hotspot-detect.html
+// - /success.html
+//
+// This MUST NOT be changed unless thoroughly tested with iOS.
+//
+IOS_SUCCESS_RESPONSE ::= """HTTP/1.1 200 OK
 Content-Type: text/html
 Cache-Control: no-store
 Connection: close
@@ -44,6 +44,26 @@ Content-Length: 165
 
 <html><head><meta http-equiv="refresh" content="0;url=/index.html" /><title>Success</title></head><body>Success - redirecting to portal...</body></html>
 """
+
+// ----- ANDROID CAPTIVE PORTAL DETECTION -----
+//
+// Android detection endpoints that need special handling:
+// - /generate_204
+// - /gen_204
+// 
+// Other detection endpoints that may need handling:
+// - /mobile/status.php (Samsung)
+// - /connecttest.txt (Windows/Android)
+// - /ncsi.txt (Windows)
+
+// General redirects to handle various platform detection mechanisms
+TEMPORARY_REDIRECTS ::= {
+  "generate_204": "/",        // Android
+  "gen_204": "/",             // Android
+  "success": "/index.html",   // iOS
+  "example.com": "/index.html", // Example.com domains
+  "connectivitycheck": "/index.html", // Android connectivity check
+}
 
 // Improved HTML with nicer form and dropdown for networks
 INDEX ::= """
@@ -168,46 +188,69 @@ run_dns network/net.Interface -> none:
   finally:
     socket.close
 
-// Unified HTTP handler for direct responses and form handling
+// Direct HTTP handler for captive portal detection and other requests
 direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
-  log.info "Starting enhanced HTTP handler"
-  result := null
+  log.info "Starting direct HTTP handler for captive portal detection"
   
-  // Android expects a proper 204 response with specific headers
+  // Android detection responses
+  
+  // 204 No Content response for Android captive portal detection
+  // Android expects this specific response for generate_204 endpoints
   ANDROID_204_RESPONSE ::= """HTTP/1.1 204 No Content
-Cache-Control: no-cache, no-store, must-revalidate
-Pragma: no-cache
-Expires: 0
-Content-Type: text/plain
-Content-Length: 0
+Cache-Control: no-cache
 Connection: close
+Content-Length: 0
 
 """.to_byte_array
 
-  // Continue running until cancelled
+  // Redirect response for other Android detection endpoints
+  ANDROID_REDIRECT_RESPONSE ::= """HTTP/1.1 302 Found
+Location: /index.html
+Cache-Control: no-cache
+Connection: close
+Content-Length: 0
+
+""".to_byte_array
+
+  // Default redirect for all other URLs
+  DEFAULT_REDIRECT_RESPONSE ::= """HTTP/1.1 302 Found
+Location: /index.html
+Cache-Control: no-cache
+Connection: close
+Content-Length: 0
+
+""".to_byte_array
+  
   while true:
+    // Accept a client connection
     client := null
     exception := catch:
       client = socket.accept
     
     if not client: continue
     
-    // Process the client request
-    handle_client_ := catch:
-      // Read request data
-      data := ByteArray 2048  // Larger buffer to handle form submissions
-      bytes_read := 0
-      client.read_bytes data 0 data.size --from=0
-      bytes_read = data.size
+    // Read request data with improved error handling
+    data := ByteArray 2048
+    bytes_read := 0
+    exception = catch:
+      try:
+        client.read_bytes data 0 data.size --from=0
+        bytes_read = data.size
+      catch error:
+        log.debug "Socket read error: $error"
+        bytes_read = 0
+    
+    if bytes_read > 0:
+      // Parse the request with improved error handling
+      request_str := ""
+      exception = catch:
+        request_str = data.to_string
       
-      if bytes_read > 0:
-        // Parse the request
-        request_str := data.to_string
-        
-        // Extract the path and method for processing
-        path := "unknown"
-        method := "GET"
-        
+      // Extract the path and method for processing
+      path := "unknown"
+      method := "GET"
+      
+      try:
         if request_str.contains "GET " or request_str.contains "POST ":
           lines := request_str.split "\r\n"
           if lines.size > 0:
@@ -216,67 +259,68 @@ Connection: close
             if parts.size > 1:
               method = parts[0]
               path = parts[1]
+      catch error:
+        log.debug "Error parsing request: $error"
+        // Keep default path and method
+      
+      log.debug "direct handler request: $method $path"
+      
+      // ----- Handle platform detection endpoints -----
+      
+      // iOS detection - success response
+      if path.contains "hotspot-detect.html" or path.contains "success.html":
+        log.info "iOS detection: sending success page"
+        client.out.write IOS_SUCCESS_RESPONSE.to_byte_array
+      
+      // Android detection - special handling
+      else if path.contains "/generate_204" or path.contains "/gen_204":
+        log.info "Android detection (204): $path - sending 204 response"
+        client.out.write ANDROID_204_RESPONSE
         
-        log.debug "request: $method $path"
+      // Other Android detection - redirect to index
+      else if path.contains "/mobile/status.php" or path.contains "connectivitycheck.gstatic.com":
+        log.info "Android detection (redirect): $path - redirecting to index"
+        client.out.write ANDROID_REDIRECT_RESPONSE
+      
+      // Windows/Other detection
+      else if path.contains "/connecttest.txt" or path.contains "/ncsi.txt":
+        log.info "Windows/Other detection: $path - redirecting to index"
+        client.out.write ANDROID_REDIRECT_RESPONSE
+      
+      // ----- Handle regular browsing -----
+      
+      // Serve main page directly
+      else if path == "/" or path == "/index.html":
+        serve_main_page client access_points
+      
+      // Form submission
+      else if method == "POST" and path.contains "?":
+        // Handle form submission
+        credentials := parse_form_submission request_str
+        if credentials and credentials.get "ssid" --if_absent=(: null):
+          log.info "Form submission received with valid credentials"
+          return credentials
+      
+      // Common domains - redirect to index
+      else if path.contains "example.com" or path.contains "www." or path.contains "captive." or path.contains "clients3.google.com":
+        log.info "Common domain request: $path - redirecting to index"
+        client.out.write DEFAULT_REDIRECT_RESPONSE
         
-        // Handle detection endpoints first - keep this fast
-        if path.contains "/generate_204" or 
-           path.contains "/gen_204" or 
-           path.contains "/mobile/status.php" or 
-           path.contains "/connecttest.txt" or 
-           path.contains "/ncsi.txt" or
-           path.contains "/check_network_status.txt":
-          // Return 204 No Content for Android/Windows
-          log.debug "Captive portal check: sending 204"
-          client.out.write ANDROID_204_RESPONSE
-          
-        else if path.contains "hotspot-detect.html" or 
-                path.contains "success.html" or 
-                path.contains "/library/test/success.html" or
-                path.contains "/captive.apple.com":
-          // iOS detection - send success response
-          log.debug "iOS check: sending success"
-          client.out.write DIRECT_SUCCESS_RESPONSE.to_byte_array
-          
-        // Handle normal pages - index and form submissions
-        else if path == "/" or path == "/index.html":
-          // Serve the main WiFi setup page
-          serve_main_page client access_points
-          
-        else if method == "POST" and path.contains "?":
-          // Handle form submission
-          credentials := parse_form_submission request_str
-          if credentials and credentials.get "ssid" --if_absent=(: null):
-            log.info "Form submission received with valid credentials"
-            return credentials
-            
-        else if request_str.contains "CONNECT ":
-          // Cannot handle HTTPS requests - just close with an error
-          log.debug "HTTPS request received (unsupported): $path"
-          headers := """HTTP/1.1 400 Bad Request
-Content-Type: text/plain
-Connection: close
-Content-Length: 31
-
-Secure connections not supported
-"""
-          client.out.write headers.to_byte_array
-          
-        else:
-          // Forward all other HTTP requests to the main page
-          log.debug "Redirecting request to main page: $path"
-          headers := """HTTP/1.1 302 Found
-Location: /index.html
-Cache-Control: no-cache
-Connection: close
-Content-Length: 0
-
-"""
-          client.out.write headers.to_byte_array
+      // All other requests - redirect to index
+      else:
+        log.debug "Other request: $path - redirecting to index"
+        client.out.write DEFAULT_REDIRECT_RESPONSE
     
-    // Always close the client socket
-    clean_up_ := catch:
-      if client: client.close
+    // Always close the client socket with improved error handling
+    if client:
+      try:
+        // Add a small delay before closing to ensure proper response delivery
+        sleep --ms=10
+        client.close
+      catch error:
+        log.debug "Error closing socket: $error"
+  
+  return null  // Should never reach here
 
 // Helper to serve the main page
 serve_main_page client/tcp.Socket access_points/List -> none:
@@ -343,112 +387,19 @@ parse_form_submission request_str/string -> Map?:
   return null
 
 run_http network/net.Interface access_points/List -> Map:
-  // Revert to using both HTTP server and direct handler
+  // Use only the direct HTTP handler for everything
   log.info "Starting captive portal web server"
   
   // Open the TCP socket for HTTP
   socket := network.tcp_listen 80
   
-  // Start a separate task for direct detection - primarily for iOS/Android detection
-  direct_task := task::
-    direct_http_respond socket access_points
+  // Get result from the direct handler - now it handles everything
+  result := direct_http_respond socket access_points
   
-  // Use the standard HTTP server as fallback
-  server := http.Server
-  result := null
+  // Clean up and return
+  socket.close
   
-  try:
-    server.listen socket:: | request writer |
-      // Handle this particular request using the original handler
-      creds := handle_http_request request writer access_points
-      if creds:
-        direct_task.cancel
-        // If we got credentials, note them and stop listening
-        result = creds
-        socket.close
-  finally:
-    // Make sure to cancel tasks when we're done
-    exception := catch:
-      direct_task.cancel
-    
-    if result: return result
-    socket.close
+  // Return the credentials if we got them
+  if result: return result
   
   unreachable
-
-// Standard HTTP handler used by the HTTP server
-handle_http_request request/http.Request writer/http.ResponseWriter access_points/List -> Map?:
-  query := url.QueryString.parse request.path
-  resource := query.resource
-  
-  // Handle various captive portal detection endpoints directly
-  if resource == "/generate_204" or 
-     resource == "/gen_204" or 
-     resource == "/mobile/status.php" or 
-     resource == "/connecttest.txt" or
-     resource == "/ncsi.txt" or
-     resource == "/check_network_status.txt":
-    // Android expects specific headers with the 204 response
-    writer.headers.set "Cache-Control" "no-cache, no-store, must-revalidate"
-    writer.headers.set "Pragma" "no-cache"
-    writer.headers.set "Expires" "0"
-    writer.headers.set "Content-Type" "text/plain"
-    writer.headers.set "Content-Length" "0"
-    writer.write_headers 204
-    return null
-    
-  if resource == "/": resource = "index.html"
-  if resource == "/hotspot-detect.html" or 
-     resource == "/success.html" or 
-     resource == "/library/test/success.html" or
-     resource == "/captive.apple.com": 
-    resource = "index.html"  // iOS detection - serve main page
-
-  // Handle redirects
-  TEMPORARY_REDIRECTS.get resource --if_present=(:|redirect_to|
-    writer.headers.set "Location" redirect_to
-    writer.write_headers 302
-    return null
-  )
-
-  // For unrecognized paths, redirect to index.html
-  if resource != "index.html":
-    writer.headers.set "Location" "/index.html"
-    writer.write_headers 302
-    return null
-
-  // Create the network options dropdown items
-  network_options := access_points.map: | ap |
-    // Mark signal strength
-    signal_strength := "Good"
-    if ap.rssi > -60: signal_strength = "Strong"
-    else if ap.rssi < -75: signal_strength = "Weak"
-    
-    // Build the select option
-    "<option value=\"$(ap.ssid)\">$(ap.ssid) ($signal_strength)</option>"
-  
-  // Set up the HTML content with our substitutions
-  writer.headers.set "Content-Type" "text/html"
-  writer.write (INDEX.substitute: { "network-options": network_options.join "\n" })
-
-  // Check if we have form parameters
-  if query.parameters.is_empty: return null
-  
-  // Handle form submission
-  ssid := ""
-  
-  // Check dropdown selection first
-  network := query.parameters.get "network" --if_absent=(: null)
-  if network and network != "custom":
-    ssid = network.trim
-  else:
-    // Check manual entry
-    ssid_param := query.parameters.get "ssid" --if_absent=(: null)
-    if ssid_param: ssid = ssid_param.trim
-  
-  // Get password
-  pw := query.parameters.get "password" --if_absent=(: "")
-  
-  // Return credentials if valid
-  if ssid != "": return { "ssid": ssid, "password": pw }
-  return null
