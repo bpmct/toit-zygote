@@ -161,21 +161,75 @@ run_dns network/net.Interface -> none:
   finally:
     socket.close
 
-// Let's skip the direct responder - it's causing compile issues
+// Fast direct HTTP handler to respond quickly to iOS captive portal detection
+direct_http_respond socket/tcp.ServerSocket -> none:
+  log.info "Starting direct HTTP responder for faster iOS detection"
+  
+  while true:
+    // Accept a client connection
+    client := null
+    exception := catch:
+      client = socket.accept
+    
+    if not client: continue
+        
+    // Read request data - minimal parsing to identify iOS detection
+    data := ByteArray 1024
+    bytes_read := 0
+    exception = catch:
+      client.read_bytes data 0 data.size --from=0
+      bytes_read = data.size
+    
+    if bytes_read > 0:
+      // Convert data to string and check for iOS detection paths
+      request_str := ""
+      exception = catch:
+        request_str = data.to_string
+      
+      log.info "Got raw request (direct handler)"
+      
+      is_ios_detection := false
+      if request_str.contains "hotspot-detect.html" or request_str.contains "success.html":
+        is_ios_detection = true
+      
+      if is_ios_detection:
+        log.info "Direct handler: iOS detection, sending redirect"
+        
+        // Send a minimal HTTP response with redirect
+        exception = catch:
+          response := DIRECT_SUCCESS_RESPONSE.to_byte_array
+          client.out.write response
+        
+        log.info "Direct handler: Response sent"
+    
+    // Always close the client socket
+    if client:
+      exception = catch:
+        client.close
 
 run_http network/net.Interface access_points/List -> Map:
   // Open the TCP socket for HTTP
   socket := network.tcp_listen 80
   
-  // Use the regular HTTP server
+  // Start a separate task for direct detection
+  direct_task := task::
+    direct_http_respond socket
+  
+  // Use the regular HTTP server for everything else
   server := http.Server
   result/Map? := null
   
   try:
     server.listen socket:: | request writer |
       result = handle_http_request request writer access_points
-      if result: socket.close
+      if result: 
+        // Cancel direct task and close socket when we have credentials
+        direct_task.cancel
+        socket.close
   finally:
+    // Make sure to cancel the direct HTTP task when we're done
+    exception := catch:
+      direct_task.cancel
     if result: return result
     socket.close
   unreachable
