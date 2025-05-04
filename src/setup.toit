@@ -21,24 +21,10 @@ CAPTIVE_PORTAL_PASSWORD ::= "12345678"
 MAX_SETUP_TIMEOUT       ::= Duration --m=30  // 30 minutes timeout instead of 15
 MAX_CONNECTION_RETRIES  ::= 3
 
-// Used for iOS captive portal detection paths
-IOS_DETECTION_PATHS ::= [
-  "/hotspot-detect.html",
-  "/library/test/success.html",
-  "/generate_204",
-  "/gen_204", 
-  "/mobile/status.php"
-]
-
-// Temporary redirects for Android
-TEMPORARY_REDIRECTS ::= {
-  "generate_204": "/",    // Used by Android captive portal detection.
-  "gen_204": "/",         // Used by Android captive portal detection.
-}
-
-// Very small response for iOS captive portal detection - with redirect to the proper page
-IOS_CAPTIVE_RESPONSE ::= """
-<html><head><title>Success</title><meta http-equiv="refresh" content="0; url=/portal.html"></head><body>Success</body></html>
+// Ultra-minimal response for iOS captive portal detection
+// This time include a meta refresh to automatically redirect to the portal
+IOS_RESPONSE ::= """
+<html><head><meta http-equiv="refresh" content="0;url=/portal.html" /><title>Success</title></head><body>Success</body></html>
 """
 
 // Simplified HTML to reduce memory usage
@@ -61,7 +47,7 @@ label{display:block;font-weight:500}
 <body>
 <h1>WiFi Setup</h1>
 {{status-message}}
-<form id="wf">
+<form>
 <label for="nw">Available Networks:</label>
 <select id="nw" name="network" onchange="hNC()">
 <option value="custom">Custom...</option>
@@ -94,26 +80,13 @@ p.style.display=t.value==="open"?"none":"block";
 }
 window.onload=function(){
 hNC();hSC();
-document.getElementById("wf").addEventListener("submit",function(e){
-var d=document.getElementById("nw"),s=document.getElementById("ss"),
-t=document.getElementById("st").value,p=document.getElementById("pw").value;
-if(d.value!=="custom"){s.disabled=false;s.value=d.value}
-if(!s.value||s.value.trim()===""){e.preventDefault();alert("Please enter a network name");return false}
-if(t==="password"&&(!p||p.trim()==="")){e.preventDefault();alert("Please enter a password");return false}
-});
 }
 </script>
 </body>
 </html>
 """
 
-// Simple and direct debug log without timestamp processing
-direct_log message/string:
-  log.debug message
-
 main:
-  // We should only run when the device is in setup mode (RUNNING is false)
-  // if mode.RUNNING: return
   run MAX_SETUP_TIMEOUT  // Use the longer timeout constant
 
 run timeout/Duration:
@@ -190,269 +163,182 @@ run_dns network/net.Interface -> none:
   finally:
     socket.close
 
-run_http network/net.Interface access_points/List status_message/string="" -> Map:
-  socket := network.tcp_listen 80
+// Create a separate simple HTTP handler that just responds to captive portal detection
+// without going through the full server processing
+direct_http_respond socket/tcp.ServerSocket -> none:
+  log.info "Starting direct HTTP responder for faster iOS detection"
+  
+  while true:
+    // Accept a client connection
+    client := null
+    exception := catch:
+      client = socket.accept
+    
+    if not client: continue
+    
+    // Get peer for logging
+    peer := "unknown"
+    exception = catch:
+      peer = client.peer.to_string
+    
+    log.info "Direct client connection from $peer"
+    
+    // Read request data - minimal parsing to identify iOS detection
+    data := ByteArray 1024
+    bytes_read := 0
+    exception = catch:
+      bytes_read = client.read data
+    
+    if bytes_read > 0:
+      // Convert data to string and check for iOS detection paths
+      request_str := ""
+      exception = catch:
+        request_str = data.to_string
+      
+      log.info "Got raw request: $(request_str.size) bytes"
+      
+      is_ios_detection := false
+      
+      if request_str.contains "GET /hotspot-detect.html" or 
+         request_str.contains "GET /library/test/success.html" or
+         request_str.contains "CaptiveNetworkSupport":
+        is_ios_detection = true
+      
+      if is_ios_detection:
+        log.info "Sending direct iOS response"
+        
+        // Send a minimal HTTP response directly
+        response := """
+HTTP/1.1 200 OK
+Content-Type: text/html
+Connection: close
+Content-Length: $(IOS_RESPONSE.size)
+
+$IOS_RESPONSE"""
+        
+        exception = catch:
+          client.write response.to_byte_array
+        
+        log.info "Sent iOS response directly"
+      else:
+        log.info "Not an iOS detection request, closing"
+    
+    // Always close the client socket
+    if client:
+      exception = catch:
+        client.close
+
+run_http network_interface/net.Interface access_points/List status_message/string="" -> Map:
+  socket := network_interface.tcp_listen 80
+  
+  // Start a task that directly handles captive portal detection
+  // This bypasses HTTP server overhead for faster response times
+  task::
+    direct_http_respond socket
+  
+  // Now start the regular server with slightly delayed execution
+  // to allow the direct responder to handle initial iOS requests
+  sleep --ms=100
+  
   server := http.Server
   
   log.info "HTTP server starting"
   
-  // Precompute the network options once
-  network_options := ""
-  exception := catch:
-    options := access_points.map: | ap |
-      str := "Good"
-      if ap.rssi > -60: str = "Strong"
-      else if ap.rssi < -75: str = "Weak"
-      "<option value=\"$(ap.ssid)\">$(ap.ssid) ($str)</option>"
-    network_options = options.join "\n"
-  
-  if exception:
-    log.info "Error preparing network options: $exception"
-    network_options = "<option value=\"example\">Custom Network</option>"
-  
-  // Precompute the full form HTML
-  portal_html := ""
-  exception = catch:
-    // Substitute the network options into the portal HTML
-    substitutions := {
-      "network-options": network_options,
-      "status-message": status_message != "" ? "<div class=\"msg\">$status_message</div>" : ""
-    }
-    portal_html = INDEX.substitute: substitutions[it]
-  
-  if exception:
-    log.info "Error preparing portal HTML: $exception"
-    portal_html = "<html><body><h1>WiFi Setup</h1><p>Error loading form. Please try again.</p></body></html>"
-  
-  log.info "Portal page precomputed and ready"
-  
-  result/Map? := null
-  try:
-    server.listen socket:: | request writer |
-      log.info "Connection received"
-      
-      // Detect path and check if it's an iOS detection request
-      path := request.path
-      is_ios_detection := false
-      user_agent := ""
-      
-      catch:
-        values := request.headers.get "User-Agent"
-        if values and values.size > 0:
-          user_agent = values[0]
-          if user_agent.contains "CaptiveNetworkSupport":
-            is_ios_detection = true
-      
-      log.info "Request path: $path (iOS detection: $is_ios_detection)"
-      
-      // Set flags for response type
-      should_send_ios_response := false
-      should_send_form := false
-      should_send_success := false
-      
-      // Process form submission if present
-      query := url.QueryString.parse path
-      ssid := ""
-      password := ""
-      
-      if is_ios_detection or IOS_DETECTION_PATHS.contains path:
-        // This is an iOS captive portal detection request
-        should_send_ios_response = true
-      else if path == "/portal.html":
-        // This is a request for the full portal after iOS detection
-        should_send_form = true
-      else if not query.parameters.is_empty:
-        // This is a form submission
-        log.info "Form submission detected"
-        
-        // Get SSID from network parameter or ssid parameter
-        wifi_network := query.parameters.get "network" --if_absent=: null
-        if wifi_network and wifi_network != "custom":
-          ssid = wifi_network.trim
-        else:
-          ssid_param := query.parameters.get "ssid" --if_absent=: null
-          if ssid_param: ssid = ssid_param.trim
-        
-        log.info "SSID from form: '$ssid'"
-        
-        if ssid != "":
-          // Set password based on security type
-          security := query.parameters.get "security_type" --if_absent=: "password"
-          
-          // Only get password if the network is not open
-          if security != "open":
-            pwd := query.parameters.get "password" --if_absent=: null
-            if pwd: password = pwd.trim
-          
-          // Set the response flag and credentials
-          should_send_success = true
-          result = { "ssid": ssid, "password": password }
-        else:
-          // No valid SSID, show form again
-          should_send_form = true
-      else:
-        // Regular request, show the form
-        should_send_form = true
-      
-      // Now send the appropriate response based on the flags
-      if should_send_ios_response:
-        log.info "Sending minimal iOS response"
-        writer.headers.set "Content-Type" "text/html"
-        writer.headers.set "Connection" "close"
-        writer.write IOS_CAPTIVE_RESPONSE
-      else if should_send_success:
-        log.info "Sending success page for network: $ssid"
-        writer.headers.set "Content-Type" "text/html"
-        writer.write """
-<html><head><title>Connected</title><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<style>body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:100%;padding:20px}
-.s{color:#4CAF50;font-size:24px;margin:20px 0}.m{background:#f8f9fa;padding:15px;margin:15px 0;border-radius:6px}
-.l{width:30px;height:30px;border:4px solid #eee;border-top:4px solid #4CAF50;border-radius:50%;animation:s 1s infinite linear;margin:20px auto}
-@keyframes s{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
-</head><body>
-<div class="s">WiFi Connected!</div>
-<div class="m">Connected to <b>$ssid</b><br>The device will restart...</div>
-<div class="l"></div>
-<p>You'll be disconnected when the device restarts.</p>
-</body></html>
-"""
-        // Close the socket if we have credentials
-        if result: socket.close
-      else if should_send_form:
-        log.info "Sending full portal page"
-        writer.headers.set "Content-Type" "text/html"
-        writer.headers.set "Cache-Control" "no-store, no-cache, must-revalidate, max-age=0"
-        writer.headers.set "Pragma" "no-cache"
-        writer.write portal_html
-  finally:
-    if result: return result
-    socket.close
-  unreachable
-
-handle_http_request request/http.Request writer/http.ResponseWriter access_points/List status_message/string="" precomputed_portal/string="?" -> Map?:
-  query := url.QueryString.parse request.path
-  resource := query.resource
-  
-  // Add detailed logging for request debugging
-  direct_log "Processing request: $resource (query size: $(query.parameters.size))"
-  
-  // Safely check for iOS user agents
-  is_ios := false
-  ua := ""
-  catch:
-    values := request.headers.get "User-Agent"
-    if values and values.size > 0:
-      ua = values[0]
-      is_ios = ua.contains "iPhone" or ua.contains "iPad" or ua.contains "CaptiveNetworkSupport"
-      direct_log "User-Agent: $ua"
-  
-  if resource == "/": resource = "index.html"
-  if resource == "/hotspot-detect.html" or
-     resource == "/generate_204" or 
-     resource == "/gen_204" or
-     resource == "/mobile/status.php" or  // Added for better iOS detection
-     resource == "/library/test/success.html":  // Added for better iOS detection
-    resource = "index.html"
-  
-  if resource.starts_with "/": resource = resource[1..]
-
-  // Using a simpler approach now - no special loading page
-  // Just go straight to the portal for all requests
-
-  TEMPORARY_REDIRECTS.get resource --if_present=:
-    direct_log "Redirecting to: $it"
-    writer.headers.set "Location" it
-    writer.write_headers 302
-    return null
-
-  if resource != "index.html":
-    direct_log "Resource not found: $resource"
-    writer.headers.set "Content-Type" "text/plain"
-    writer.write_headers 404
-    writer.write "Not found: $resource"
-    return null
-
-  // Check if this is a form submission with credentials
-  wifi_credentials := null
-  if not query.parameters.is_empty:
-    direct_log "Form submission detected"
-    // Get SSID from network parameter or ssid parameter
-    ssid := ""
-    network := query.parameters.get "network" --if_absent=: null
-    if network and network != "custom":
-      ssid = network.trim
-    else:
-      ssid_param := query.parameters.get "ssid" --if_absent=: null
-      if ssid_param: ssid = ssid_param.trim
-    
-    direct_log "SSID from form: '$ssid'"
-    
-    if ssid != "":
-      // Set password based on security type
-      password := ""
-      security := query.parameters.get "security_type" --if_absent=: "password"
-      
-      // Only get password if the network is not open
-      if security != "open":
-        pwd := query.parameters.get "password" --if_absent=: null
-        if pwd: password = pwd.trim
-      
-      wifi_credentials = { "ssid": ssid, "password": password }
-      
-      // Write minimal success page
-      direct_log "Sending success page for network: $ssid"
-      writer.headers.set "Content-Type" "text/html"
-      writer.write """
-<html><head><title>Connected</title><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<style>body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:100%;padding:20px}
-.s{color:#4CAF50;font-size:24px;margin:20px 0}.m{background:#f8f9fa;padding:15px;margin:15px 0;border-radius:6px}
-.l{width:30px;height:30px;border:4px solid #eee;border-top:4px solid #4CAF50;border-radius:50%;animation:s 1s infinite linear;margin:20px auto}
-@keyframes s{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
-</head><body>
-<div class="s">WiFi Connected!</div>
-<div class="m">Connected to <b>$ssid</b><br>The device will restart...</div>
-<div class="l"></div>
-<p>You'll be disconnected when the device restarts.</p>
-</body></html>
-"""
-      direct_log "Success page sent, returning credentials"
-      return wifi_credentials
-
-  // Use the precomputed portal page if available, otherwise build it
-  if precomputed_portal != "?":
-    direct_log "Using precomputed portal page"
-    writer.headers.set "Content-Type" "text/html"
-    // Set cache-control headers to prevent caching
-    writer.headers.set "Cache-Control" "no-store, no-cache, must-revalidate, max-age=0"
-    writer.headers.set "Pragma" "no-cache"
-    writer.write precomputed_portal
-    direct_log "Portal page sent"
-    return null
-  
-  // Create simplified network options for faster loading
-  direct_log "Building portal page with $(access_points.size) networks"
+  // Create network options HTML
   network_options := access_points.map: | ap |
     str := "Good"
     if ap.rssi > -60: str = "Strong"
     else if ap.rssi < -75: str = "Weak"
     "<option value=\"$(ap.ssid)\">$(ap.ssid) ($str)</option>"
-  network_options_string := network_options.join "\n"
   
-  // Create status message HTML if there is a message, but keep it minimal
-  status_html := ""
-  if status_message != "":
-    status_html = "<div class=\"msg\">$status_message</div>"
-
-  direct_log "Rendering portal form"
+  // Prepare the main portal page HTML
   substitutions := {
-    "network-options": network_options_string,
-    "status-message": status_html
+    "network-options": network_options.join "\n",
+    "status-message": status_message != "" ? "<div class=\"msg\">$status_message</div>" : ""
   }
-  writer.headers.set "Content-Type" "text/html"
-  // Set cache-control headers to prevent caching
-  writer.headers.set "Cache-Control" "no-store, no-cache, must-revalidate, max-age=0"
-  writer.headers.set "Pragma" "no-cache"
-  writer.write (INDEX.substitute: substitutions[it])
-  direct_log "Portal page sent"
-
-  return null
+  portal_html := INDEX.substitute: substitutions[it]
+  
+  result := null
+  
+  try:
+    server.listen socket:: | request writer |
+      // Skip processing connect requests
+      if request.method == "CONNECT":
+        log.debug "Skipping CONNECT request"
+      else:
+        path := request.path
+        log.info "Request: $path"
+        
+        // Handle iOS captive portal detection (backup for the direct handler)
+        if path == "/hotspot-detect.html" or path == "/library/test/success.html":
+          log.info "Sending iOS detection response (from regular server)"
+          writer.headers.set "Content-Type" "text/html"
+          writer.headers.set "Connection" "close"
+          writer.write IOS_RESPONSE
+        
+        // Handle the explicit portal page request
+        else if path == "/portal.html":
+          log.info "Showing portal page"
+          writer.headers.set "Content-Type" "text/html"
+          writer.headers.set "Cache-Control" "no-store, no-cache"
+          writer.write portal_html
+        
+        // Handle form submission
+        else if path.contains "?":
+          query := url.QueryString.parse path
+          
+          // Get SSID from network parameter or ssid parameter
+          ssid := ""
+          wifi_network := query.parameters.get "network" --if_absent=: null
+          if wifi_network and wifi_network != "custom":
+            ssid = wifi_network.trim
+          else:
+            ssid_param := query.parameters.get "ssid" --if_absent=: null
+            if ssid_param: ssid = ssid_param.trim
+          
+          if ssid != "":
+            // Get password if needed
+            password := ""
+            security := query.parameters.get "security_type" --if_absent=: "password"
+            if security != "open":
+              pwd := query.parameters.get "password" --if_absent=: null
+              if pwd: password = pwd.trim
+            
+            // Return the credentials
+            log.info "Form submitted - ssid: $ssid"
+            result = {:}
+            result["ssid"] = ssid
+            result["password"] = password
+            
+            // Show success page
+            writer.headers.set "Content-Type" "text/html"
+            writer.write """
+<html><head><title>Connected</title><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<style>body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:100%;padding:20px}
+.s{color:#4CAF50;font-size:24px;margin:20px 0}.m{background:#f8f9fa;padding:15px;margin:15px 0;border-radius:6px}
+.l{width:30px;height:30px;border:4px solid #eee;border-top:4px solid #4CAF50;border-radius:50%;animation:s 1s infinite linear;margin:20px auto}
+@keyframes s{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
+</head><body>
+<div class="s">WiFi Connected!</div>
+<div class="m">Connected to <b>$ssid</b><br>The device will restart...</div>
+<div class="l"></div>
+<p>You'll be disconnected when the device restarts.</p>
+</body></html>
+"""
+            socket.close
+          else:
+            // Show the portal again for invalid submissions
+            writer.headers.set "Content-Type" "text/html"
+            writer.headers.set "Cache-Control" "no-store, no-cache"
+            writer.write portal_html
+        
+        // Default case - show the portal
+        else:
+          log.info "Showing portal page (default)"
+          writer.headers.set "Content-Type" "text/html"
+          writer.headers.set "Cache-Control" "no-store, no-cache"
+          writer.write portal_html
+  finally:
+    if result: return result
+    socket.close
+  unreachable
