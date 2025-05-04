@@ -1,0 +1,115 @@
+/**
+ * Cursor Rules for the Toit Programming Language
+ * Based on Toit's syntax (https://docs.toit.io/language/syntax/)
+ * 
+ * Useful references when stuck:
+ * - Language reference: https://docs.toit.io/language/
+ * - Standard library: https://libs.toit.io/
+ * - Package registry: https://pkg.toit.io/
+ */
+
+// File extension to match
+match_files("*.toit")
+
+// Keywords
+keyword("abstract", "and", "as", "assert", "break", "catch", "class", "continue", 
+       "constructor", "else", "export", "false", "finally", "for", "if", "import", 
+       "is", "not", "null", "or", "return", "static", "true", "try", "while")
+
+// Declaration tokens
+token("::=", "declaration") // Final global/constant
+token(":=", "declaration")  // Variable declaration
+token("=", "assignment")    // Variable assignment
+
+// Comments
+comment("//", "\n")         // Single-line comments
+comment("/*", "*/")         // Multi-line comments
+
+// Strings
+string("\"", "\"", "\\")    // Double-quoted strings
+string("\"\"\"", "\"\"\"", "\\") // Triple-quoted multi-line strings
+string("'", "'", "\\")      // Character literals
+
+// Literals
+literal(/\b[0-9]+\b/)             // Integer literals
+literal(/\b[0-9]+\.[0-9]+\b/)     // Float literals
+literal(/\b0x[0-9a-fA-F]+\b/)     // Hex literals
+literal(/\b#\[[^\]]*\]\b/)        // ByteArray literals
+
+// Block starts
+token(":", "blockStart")
+
+// Lists, Maps, and Sets literals
+token("[]", "listLiteral")
+token("[", "listStart")
+token("]", "listEnd")
+token("{:}", "mapLiteral")
+token("{}", "setLiteral")
+token("{", "setStart")
+token("}", "setEnd")
+
+// Special Identifiers
+token("this", "self")
+token("super", "self")
+token("it", "special")        // Special variable for blocks
+
+// Operators
+operator("+", "-", "*", "/", "%", "<<", ">>", ">>>", "&", "|", "^", "~", "++", "--")
+operator("<", "<=", ">", ">=", "==", "!=")
+operator("+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=", ">>>=")
+
+// Function patterns
+pattern(/^[a-zA-Z_][a-zA-Z0-9_-]*:/, "functionDefinition")
+
+// Class patterns
+pattern(/^class [a-zA-Z_][a-zA-Z0-9_-]*:/, "classDefinition")
+pattern(/^constructor/, "constructorDefinition")
+
+// Import patterns
+pattern(/^import [a-zA-Z0-9_.-]+/, "importStatement")
+pattern(/^import [a-zA-Z0-9_.-]+ show/, "importStatement")
+pattern(/^import [a-zA-Z0-9_.-]+ as/, "importStatement")
+
+// String interpolation
+token("$", "interpolation")
+pattern(/\$\([^)]*\)/, "interpolation")
+pattern(/\$[a-zA-Z_][a-zA-Z0-9_.-]*/, "interpolation")
+
+// Type annotations
+pattern(/\/[a-zA-Z_][a-zA-Z0-9_-]*/, "typeAnnotation")
+pattern(/-> [a-zA-Z_][a-zA-Z0-9_-]*/, "returnType")
+
+// Function arguments
+pattern(/--[a-zA-Z_][a-zA-Z0-9_-]*=/, "namedArgument")
+pattern(/--[a-zA-Z_][a-zA-Z0-9_-]*/, "namedArgument")
+
+// Lambda and block expressions
+token("::", "lambdaStart")
+token(":", "blockStart")
+pattern(/\| [^|]+ \|/, "blockParams") 
+
+// Field declarations in constructors
+pattern(/\.[a-zA-Z_][a-zA-Z0-9_-]*/, "fieldParameter")
+
+// Common standard library patterns
+pattern(/Duration --s=/, "durationExpression")
+pattern(/Duration --ms=/, "durationExpression")
+pattern(/Duration --us=/, "durationExpression")
+pattern(/ByteArray [0-9]+/, "byteArrayDeclaration")
+
+/**
+ * HELP COMMENTS
+ * 
+ * When stuck with Toit syntax, refer to:
+ * 1. Official documentation: https://docs.toit.io/language/
+ * 2. Standard library reference: https://libs.toit.io/
+ * 3. Package registry: https://pkg.toit.io/
+ * 
+ * Common patterns:
+ * - Class fields: name := value
+ * - Constants: NAME ::= value
+ * - Constructor field parameters: constructor .field=default:
+ * - Block syntax: collection.method: operation
+ * - Map access with default: map.get key --if_absent=: default
+ * - Named arguments: function --name=value
+ */ 
