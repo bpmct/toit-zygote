@@ -36,9 +36,9 @@ TEMPORARY_REDIRECTS ::= {
   "gen_204": "/",         // Used by Android captive portal detection.
 }
 
-// Very small response for iOS captive portal detection
+// Very small response for iOS captive portal detection - with redirect to the proper page
 IOS_CAPTIVE_RESPONSE ::= """
-<html><head><title>Success</title></head><body>Success</body></html>
+<html><head><title>Success</title><meta http-equiv="refresh" content="0; url=/portal.html"></head><body>Success</body></html>
 """
 
 // Simplified HTML to reduce memory usage
@@ -86,7 +86,7 @@ label{display:block;font-weight:500}
 function hNC(){
 var d=document.getElementById("nw"),s=document.getElementById("ss"),c=document.getElementById("sc");
 if(d.value==="custom"){s.value="";s.disabled=false;c.classList.remove("hidden")}
-else{s.value=d.value;s.disabled=trues;c.classList.add("hidden")}
+else{s.value=d.value;s.disabled=true;c.classList.add("hidden")}
 }
 function hSC(){
 var t=document.getElementById("st"),p=document.getElementById("pc");
@@ -258,6 +258,9 @@ run_http network/net.Interface access_points/List status_message/string="" -> Ma
       if is_ios_detection or IOS_DETECTION_PATHS.contains path:
         // This is an iOS captive portal detection request
         should_send_ios_response = true
+      else if path == "/portal.html":
+        // This is a request for the full portal after iOS detection
+        should_send_form = true
       else if not query.parameters.is_empty:
         // This is a form submission
         log.info "Form submission detected"
