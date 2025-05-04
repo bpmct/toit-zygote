@@ -14,12 +14,16 @@ import net.wifi
 import http
 import dns_simple_server as dns
 
-import .mode as mode
+// No longer importing mode
+// import .mode as mode
+
+import io  // Import IO for system diagnostics
 
 CAPTIVE_PORTAL_SSID     ::= "mywifi"
 CAPTIVE_PORTAL_PASSWORD ::= "12345678"
-MAX_SETUP_TIMEOUT       ::= Duration --m=30  // 30 minutes timeout instead of 15
-MAX_CONNECTION_RETRIES  ::= 3
+MAX_SETUP_TIMEOUT       ::= Duration --m=120  // Extended to 2 hours for reliable operation
+MAX_CONNECTION_RETRIES  ::= 10   // Increased even more for reliability
+RUNNING                 ::= true // Force running mode
 
 // Ultra-minimal response for iOS captive portal detection
 // Include a meta refresh to automatically redirect to the full portal
@@ -98,26 +102,107 @@ hNC();hSC();
 """
 
 main:
-  run MAX_SETUP_TIMEOUT  // Use the longer timeout constant
+  // Make sure we run for at least 2 minutes after starting
+  timeout := Duration --m=2
+  if MAX_SETUP_TIMEOUT > timeout:
+    timeout = MAX_SETUP_TIMEOUT
+    
+  log.info "Starting setup with timeout: $timeout"
+  log.info "WARNING: This container will NOT stop automatically - you need to restart the device"
+  
+  // Start a watchdog process that will keep this container alive
+  // This will ensure that if the main process crashes, the container stays running
+  watchdog_task := task::
+    watchdog_start_time := Time.monotonic_us
+    while true:
+      log.info "Watchdog: Container uptime $(Duration --us=(Time.monotonic_us - watchdog_start_time))"
+      sleep --ms=300000  // Check every 5 minutes (300000ms)
+  
+  // Force RUNNING to true to stay in setup mode, avoiding mode switching
+  // This will keep the container running until we're done
+  exception := catch --trace:
+    run timeout
+  
+  if exception:
+    log.error "Setup failed with error: $exception" 
+    log.error "Error details: $exception"
+    // Ensure we don't exit even on error
+    log.info "Error detected, but container will CONTINUE RUNNING"
+    sleep --ms=300000  // Sleep for 5 minutes (300000ms)
+    
+    // Try again with a while loop to keep trying
+    log.info "Attempting to restart setup process after error"
+    while true:
+      retry_exception := catch --trace:
+        run timeout
+      
+      if retry_exception:
+        log.error "Retry also failed: $retry_exception"
+      
+      log.info "Setup process completed or failed, waiting before possible retry"
+      sleep --ms=300000  // Sleep for 5 minutes (300000ms)
+
+// Print system information to help with debugging
+print_system_info:
+  // Just log basic information instead of trying to access io.free, env, etc.
+  log.info "System info - Starting diagnostic logging"
+  log.info "System time: $Time.now"
+  log.info "Monotonic time: $(Time.monotonic_us)"
 
 run timeout/Duration:
+  start_time := Time.monotonic_us
 
+  // Print system diagnostics at startup
+  print_system_info
+  
+  log.info "Setup container started, will run for at least $timeout"
   log.info "scanning for wifi access points"
   channels := ByteArray 12: it + 1
-  access_points := wifi.scan channels
-  access_points.sort --in_place: | a b | b.rssi.compare_to a.rssi
+  
+  // Robustly handle WiFi scanning with retries
+  scan_attempts := 0
+  max_scan_attempts := 5
+  access_points := []
+  
+  while scan_attempts < max_scan_attempts and access_points.is_empty:
+    log.info "WiFi scan attempt $(scan_attempts + 1)/$max_scan_attempts"
+    scan_exception := catch:
+      access_points = wifi.scan channels
+    
+    if scan_exception:
+      log.warn "WiFi scan failed: $scan_exception"
+      scan_attempts++
+      sleep --ms=1000
+    else:
+      if access_points.is_empty:
+        log.warn "WiFi scan returned no access points, retrying..."
+        scan_attempts++
+        sleep --ms=2000
+      else:
+        log.info "WiFi scan successful, found $(access_points.size) networks"
+        break
+  
+  // Sort access points by signal strength
+  if not access_points.is_empty:
+    access_points.sort --in_place: | a b | b.rssi.compare_to a.rssi
 
   log.info "establishing wifi in AP mode ($CAPTIVE_PORTAL_SSID)"
   status_message := ""
+  wifi_config_successful := false
   
-  while true:
+  while (Duration --us=(Time.monotonic_us - start_time)) < timeout or not wifi_config_successful:
+    elapsed_us := Time.monotonic_us - start_time
+    elapsed := Duration --us=elapsed_us
+    remaining := timeout - elapsed
+    log.info "Starting AP mode cycle. Time elapsed: $elapsed, Time remaining: $remaining"
+    
     network_ap := wifi.establish
         --ssid=CAPTIVE_PORTAL_SSID
         --password=CAPTIVE_PORTAL_PASSWORD
     credentials/Map? := null
 
     portal_exception := catch:
-      with_timeout timeout:
+      with_timeout (Duration --m=5):  // Limit each portal attempt to 5 minutes
         credentials = run_captive_portal network_ap access_points status_message
 
     if portal_exception: 
@@ -128,8 +213,9 @@ run timeout/Duration:
     try:
       network_ap.close
     finally:
-      // Ensure we always continue to the next iteration if no credentials
-      if not credentials: continue
+      if not credentials: 
+        log.info "No credentials received, continuing AP mode"
+        continue
 
     if credentials:
       retry_count := 0
@@ -138,25 +224,195 @@ run timeout/Duration:
       while retry_count < MAX_CONNECTION_RETRIES and not connected:
         exception := catch:
           log.info "connecting to wifi in STA mode (attempt $(retry_count + 1))" --tags=credentials
+          
+          // MODIFIED APPROACH: Don't close the network until much later
+          // This will keep the WiFi connection alive longer
           network_sta := wifi.open
               --save
               --ssid=credentials["ssid"]
               --password=credentials["password"]
           
-          // Make sure we properly closed the network
-          network_sta.close
+          // Wait for the connection to actually complete
+          log.info "WiFi connection initiated, waiting for it to complete..."
+          
+          // Make sure we have a valid IP address before continuing
+          ip_address := null
+          max_wait_attempts := 60  // Maximum 30 seconds (60 * 500ms)
+          wait_attempts := 0
+          
+          while wait_attempts < max_wait_attempts:
+            // Check if we have an IP address
+            ip_address = network_sta.address
+            if ip_address:
+              log.info "Successfully connected with IP address: $ip_address" --tags=credentials
+              break
+            else:
+              log.info "Waiting for IP address assignment (attempt $(wait_attempts + 1)/60)..."
+              sleep --ms=500  // Check every 500ms
+              wait_attempts++
+          
+          if not ip_address:
+            throw "Failed to obtain IP address after successful connection"
+          
+          // Keep the network connection open for a long time to ensure it's saved
+          log.info "Successfully connected to WiFi with IP: $ip_address, keeping connection open for 60+ seconds..."
           log.info "connecting to wifi in STA mode => success" --tags=credentials
+          
+          // Test the connection to make sure it's working
+          log.info "Testing connection..."
+          
+          // Verify connectivity by trying to make a DNS query or TCP connection
+          connect_success := false
+          network_test_exception := catch --trace:
+            log.info "Testing network connectivity to 8.8.8.8:53..."
+            test_socket := network_sta.tcp_connect "8.8.8.8" 53
+            if test_socket:
+              log.info "Network connectivity test successful!"
+              test_socket.close
+              connect_success = true
+            else:
+              log.info "Network connectivity test failed - will still continue"
+          
+          if network_test_exception:
+            log.info "Error during network test: $network_test_exception - will still continue"
+          
+          // Set flags to indicate success - even if the connection test failed
+          // this is because the WiFi might just be isolated from the internet
           connected = true
-          return
+          wifi_config_successful = true
+          
+          // Long delay while keeping network open - increased to 60 seconds
+          log.info "Delaying for 60 seconds with network connection open"
+          delay_start := Time.monotonic_us
+          target_delay := Duration --s=60
+          
+          while (Duration --us=(Time.monotonic_us - delay_start)) < target_delay:
+            // Periodically log to show we're still alive
+            if (Time.monotonic_us - delay_start) % 5000000 < 100000:  // Log every ~5 seconds
+              curr_elapsed := Duration --us=(Time.monotonic_us - delay_start)
+              curr_remaining := target_delay - curr_elapsed
+              log.info "Connection active for $curr_elapsed, waiting $curr_remaining more with active connection"
+            sleep --ms=100
+          
+          // Make sure the connection is still good after the delay
+          ip_address = network_sta.address
+          log.info "After delay, IP address is: $ip_address"
+          
+          // Now save again and explicitly close the connection
+          log.info "WiFi connection maintained for 30+ seconds. Now saving configuration and closing..."
+          
+          // Try to explicitly save the configuration again by reopening with save flag
+          log.info "Re-saving WiFi configuration for: $(credentials["ssid"])"
+          
+          // IMPORTANT: Use multiple save attempts to ensure the configuration persists
+          // This is critical to prevent the container stopping issue          
+          for i := 0; i < 3; i++:
+            log.info "Save attempt $(i+1)/3 for WiFi configuration"
+            
+            close_exception := catch --trace:
+              // First make sure the previous connection is fully closed
+              network_sta.close
+              log.info "Previous WiFi connection closed successfully"
+              sleep --ms=2000  // Wait longer between close/open
+            
+            if close_exception:
+              log.warn "Error closing network connection: $close_exception"
+              // Continue anyway
+            
+            reopen_exception := catch --trace:
+              // Open with save flag
+              log.info "Opening WiFi connection with --save flag (attempt $(i+1)/3)"
+              temporary_net := wifi.open
+                  --save
+                  --ssid=credentials["ssid"]
+                  --password=credentials["password"]
+              
+              // Check for IP address to confirm connection success
+              temp_ip := null
+              wait_count := 0
+              while wait_count < 20 and not temp_ip:
+                temp_ip = temporary_net.address
+                if temp_ip:
+                  log.info "Reconnection successful with IP: $temp_ip"
+                  break
+                sleep --ms=200
+                wait_count++
+              
+              log.info "Keeping save connection open for 10 seconds..."
+              sleep --ms=10000  // Keep open longer on each attempt
+              
+              log.info "Save attempt $(i+1) complete, closing connection"
+              temporary_net.close
+            
+            if reopen_exception:
+              log.warn "Error during configuration re-save attempt $(i+1): $reopen_exception"
+          
+          log.info "WiFi configuration explicitly re-saved for: $(credentials["ssid"])"
+          
+          // Set both connected and wifi_config_successful flags
+          connected = true
+          wifi_config_successful = true
+          
+          // Log success info
+          log.info "WiFi connection closed, configuration should be saved successfully"
+          log.info "Container will continue running to ensure settings are applied"
         
         if exception:
-          log.warn "connecting to wifi in STA mode => failed (attempt $(retry_count + 1))" --tags=credentials
+          log.warn "connecting to wifi in STA mode => failed (attempt $(retry_count + 1)): $exception" --tags=credentials
           retry_count++
           // Create a status message with the SSID from credentials
           ssid := credentials["ssid"]
           status_message = "Failed to connect to $ssid. Please check your credentials and try again."
           // Short sleep before retrying
           sleep --ms=1000
+
+  // After the main loop completes, check if we need to stay alive longer
+  elapsed_us := Time.monotonic_us - start_time
+  elapsed := Duration --us=elapsed_us
+  
+  // Always stay alive for the full timeout, plus extra time to ensure changes persist
+  remaining := timeout - elapsed
+  if remaining > Duration.ZERO:
+    log.info "WiFi setup completed, but staying alive for $remaining more to ensure settings apply"
+    sleep remaining
+  
+  // Add additional delay to ensure ESP32 has time to save configuration
+  extra_delay := Duration --m=1
+  log.info "Adding extra $extra_delay delay to ensure configuration persists"
+  sleep extra_delay
+    
+  final_elapsed := Duration --us=(Time.monotonic_us - start_time)
+  log.info "Setup container completed successfully after running for $final_elapsed"
+  
+  // Force this container to stay running indefinitely
+  // This prevents the container from stopping until system restart
+  log.info "Setup complete - now keeping container alive indefinitely"
+  forever_counter := 0
+  while true:
+    // Use a counter to only log occasionally to reduce log spam
+    if forever_counter % 60 == 0:
+      log.info "Setup container still running... (wifi configured as: $(wifi_config_successful ? "SUCCESS" : "PENDING")) (uptime: $(Duration --us=(Time.monotonic_us - start_time)))"
+    
+    // Every 5 minutes, try to verify the WiFi configuration is still working
+    // but only attempt to open a new connection periodically
+    if wifi_config_successful and forever_counter % 300 == 0 and forever_counter > 0:
+      log.info "Performing periodic WiFi health check"
+      // Just check if WiFi is working in general, not with specific credentials
+      check_exception := catch --trace:
+        // Try to open a default connection without specifying credentials
+        check_net := net.open
+        if check_net:
+          check_ip := check_net.address
+          log.info "WiFi health check successful - current IP: $check_ip"
+          check_net.close
+        else:
+          log.warn "WiFi health check failed - no connection obtained"
+      
+      if check_exception:
+        log.warn "WiFi health check failed: $check_exception"
+    
+    forever_counter++
+    sleep --ms=1000  // Sleep for 1 second (1000ms)
 
 run_captive_portal network/net.Interface access_points/List status_message/string="" -> Map:
   results := Task.group --required=1 [
