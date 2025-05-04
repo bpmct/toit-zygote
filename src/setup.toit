@@ -93,6 +93,32 @@ if(t==="password"&&(!p||p.trim()==="")){e.preventDefault();alert("Please enter a
 </html>
 """
 
+// Success page template to show before restarting
+SUCCESS_PAGE ::= """
+<html>
+<head>
+<title>WiFi Connected</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:20px auto;padding:15px;font-size:16px;text-align:center}
+h1{color:#4CAF50}
+.msg{padding:15px;margin:15px 0;border-radius:6px;background:#f8f9fa;border-left:4px solid #4CAF50}
+.loader{margin:30px auto;border:5px solid #f3f3f3;border-top:5px solid #4CAF50;border-radius:50%;width:50px;height:50px;animation:spin 2s linear infinite}
+@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<h1>WiFi Connected!</h1>
+<div class="msg">
+<p>Successfully connected to <strong>{{network-name}}</strong></p>
+<p>The device is now configuring and will restart automatically.</p>
+</div>
+<div class="loader"></div>
+<p>Please do not close this page. You'll be disconnected when the device restarts.</p>
+</body>
+</html>
+"""
+
 main:
   // We should only run when the device is in setup mode (RUNNING is false)
   // if mode.RUNNING: return
@@ -203,6 +229,58 @@ handle_http_request request/http.Request writer/http.ResponseWriter access_point
     writer.write "Not found: $resource"
     return null
 
+  // Check if this is a form submission with credentials
+  wifi_credentials := null
+  if not query.parameters.is_empty:
+    // Get SSID from network parameter or ssid parameter
+    ssid := ""
+    network := query.parameters.get "network" --if_absent=: null
+    if network and network != "custom":
+      ssid = network.trim
+    else:
+      ssid_param := query.parameters.get "ssid" --if_absent=: null
+      if ssid_param: ssid = ssid_param.trim
+    
+    if ssid != "":
+      // Set password based on security type
+      password := ""
+      security := query.parameters.get "security_type" --if_absent=: "password"
+      
+      // Only get password if the network is not open
+      if security != "open":
+        pwd := query.parameters.get "password" --if_absent=: null
+        if pwd: password = pwd.trim
+      
+      wifi_credentials = { "ssid": ssid, "password": password }
+      
+      // Write the success page instead of the form
+      writer.headers.set "Content-Type" "text/html"
+      writer.write """
+<html>
+<head>
+<title>WiFi Connected</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:20px auto;padding:15px;font-size:16px;text-align:center}
+h1{color:#4CAF50}
+.msg{padding:15px;margin:15px 0;border-radius:6px;background:#f8f9fa;border-left:4px solid #4CAF50}
+.loader{margin:30px auto;border:5px solid #f3f3f3;border-top:5px solid #4CAF50;border-radius:50%;width:50px;height:50px;animation:spin 2s linear infinite}
+@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<h1>WiFi Connected!</h1>
+<div class="msg">
+<p>Successfully connected to <strong>$ssid</strong></p>
+<p>The device is now configuring and will restart automatically.</p>
+</div>
+<div class="loader"></div>
+<p>Please do not close this page. You'll be disconnected when the device restarts.</p>
+</body>
+</html>
+"""
+      return wifi_credentials
+
   // Create network options for the dropdown
   network_options := access_points.map: | ap |
     str := "Good"
@@ -210,7 +288,7 @@ handle_http_request request/http.Request writer/http.ResponseWriter access_point
     else if ap.rssi < -75: str = "Weak"
     "<option value=\"$(ap.ssid)\">$(ap.ssid) ($str)</option>"
   network_options_string := network_options.join "\n"
-
+  
   // Create status message HTML if there is a message, but keep it minimal
   status_html := ""
   if status_message != "":
@@ -223,26 +301,4 @@ handle_http_request request/http.Request writer/http.ResponseWriter access_point
   writer.headers.set "Content-Type" "text/html"
   writer.write (INDEX.substitute: substitutions[it])
 
-  if query.parameters.is_empty: return null
-  
-  // Get SSID from network parameter or ssid parameter
-  ssid := ""
-  network := query.parameters.get "network" --if_absent=: null
-  if network and network != "custom":
-    ssid = network.trim
-  else:
-    ssid_param := query.parameters.get "ssid" --if_absent=: null
-    if ssid_param: ssid = ssid_param.trim
-  
-  if ssid == "": return null
-  
-  // Set password based on security type
-  password := ""
-  security := query.parameters.get "security_type" --if_absent=: "password"
-  
-  // Only get password if the network is not open
-  if security != "open":
-    pwd := query.parameters.get "password" --if_absent=: null
-    if pwd: password = pwd.trim
-  
-  return { "ssid": ssid, "password": password }
+  return null
