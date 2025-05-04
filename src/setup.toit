@@ -101,6 +101,7 @@ main:
   run MAX_SETUP_TIMEOUT  // Use the longer timeout constant
 
 run timeout/Duration:
+
   log.info "scanning for wifi access points"
   channels := ByteArray 12: it + 1
   access_points := wifi.scan channels
@@ -116,12 +117,14 @@ run timeout/Duration:
     credentials/Map? := null
 
     portal_exception := catch:
-      credentials = (with_timeout timeout: run_captive_portal network_ap access_points status_message)
+      with_timeout timeout:
+        credentials = run_captive_portal network_ap access_points status_message
 
     if portal_exception: 
       log.info "Captive portal exception: $portal_exception"
       status_message = "Connection attempt timed out. Please try again."
 
+    // Always close the AP network interface
     try:
       network_ap.close
     finally:
@@ -139,6 +142,8 @@ run timeout/Duration:
               --save
               --ssid=credentials["ssid"]
               --password=credentials["password"]
+          
+          // Make sure we properly closed the network
           network_sta.close
           log.info "connecting to wifi in STA mode => success" --tags=credentials
           connected = true
@@ -165,6 +170,8 @@ run_dns network/net.Interface -> none:
   socket := network.udp_open --port=53
   hosts := dns.SimpleDnsServer device_ip_address  // Answer the device IP to all queries.
 
+  log.info "DNS server started on $device_ip_address"
+
   try:
     while not Task.current.is_canceled:
       datagram/udp.Datagram := socket.receive
@@ -172,71 +179,79 @@ run_dns network/net.Interface -> none:
       if not response: continue
       socket.send (udp.Datagram response datagram.address)
   finally:
-    socket.close
+    log.info "Closing DNS server"
+    exception := catch: socket.close
+    if exception: log.warn "DNS server exception: $exception"
 
 // Create a separate simple HTTP handler that just responds to captive portal detection
 // without going through the full server processing
 direct_http_respond socket/tcp.ServerSocket -> none:
   log.info "Starting direct HTTP responder for faster iOS detection"
   
-  while true:
-    // Accept a client connection
-    client := null
-    exception := catch:
-      client = socket.accept
-    
-    if not client: continue
-    
-    // Get peer info for logging
-    peer := "unknown"
-    exception = catch:
-      peer = client.peer.to_string
-    
-    log.info "Direct client connection from $peer"
-    
-    // Read request data - minimal parsing to identify iOS detection
-    data := ByteArray 1024
-    bytes_read := 0
-    exception = catch:
-      bytes_read = client.read data
-    
-    if bytes_read > 0:
-      // Convert data to string and check for iOS detection paths
-      request_str := ""
+  try:
+    while not Task.current.is_canceled:
+      // Accept a client connection
+      client := null
+      exception := catch:
+        client = socket.accept
+      
+      if not client: continue
+      
+      // Get peer info for logging
+      peer := "unknown"
       exception = catch:
-        request_str = data.to_string
+        peer = client.peer.to_string
       
-      log.info "Got raw request: $(request_str.size) bytes"
+      log.info "Direct client connection from $peer"
       
-      is_ios_detection := false
+      // Read request data - minimal parsing to identify iOS detection
+      data := ByteArray 1024
+      bytes_read := 0
+      exception = catch:
+        bytes_read = client.read data
       
-      if request_str.contains "GET /hotspot-detect.html" or 
-         request_str.contains "GET /library/test/success.html" or
-         request_str.contains "CaptiveNetworkSupport":
-        is_ios_detection = true
-      
-      if is_ios_detection:
-        log.info "Sending direct iOS response with auto-redirect"
-        
-        // Send a minimal HTTP response with redirect
+      if bytes_read > 0:
+        // Convert data to string and check for iOS detection paths
+        request_str := ""
         exception = catch:
-          client.write DIRECT_SUCCESS_RESPONSE.to_byte_array
+          request_str = data.to_string
         
-        log.info "Sent iOS response directly with redirect"
-      else:
-        log.info "Not an iOS detection request, closing"
-    
-    // Always close the client socket
-    if client:
-      exception = catch:
-        client.close
+        log.info "Got raw request: $(request_str.size) bytes"
+        
+        is_ios_detection := false
+        
+        if request_str.contains "GET /hotspot-detect.html" or 
+           request_str.contains "GET /library/test/success.html" or
+           request_str.contains "CaptiveNetworkSupport":
+          is_ios_detection = true
+        
+        if is_ios_detection:
+          log.info "Sending direct iOS response with auto-redirect"
+          
+          // Send a minimal HTTP response with redirect
+          exception = catch:
+            client.write DIRECT_SUCCESS_RESPONSE.to_byte_array
+          
+          log.info "Sent iOS response directly with redirect"
+        else:
+          log.info "Not an iOS detection request, closing"
+      
+      // Always close the client socket
+      if client:
+        exception = catch:
+          client.close
+  finally:
+    log.info "Direct HTTP responder shutting down"
+    exception := catch: 
+      // Nothing to close here, socket is closed elsewhere
+      null
 
 run_http network_interface/net.Interface access_points/List status_message/string="" -> Map:
   socket := network_interface.tcp_listen 80
   
   // Start a task that directly handles captive portal detection
   // This bypasses HTTP server overhead for faster response times
-  task::
+  direct_task_var := task::
     direct_http_respond socket
   
   // Now start the regular server with slightly delayed execution
@@ -335,9 +350,12 @@ run_http network_interface/net.Interface access_points/List status_message/strin
             writer.write success_page
             writer.close
             
+            // Cancel the direct HTTP task
+            exception := catch: direct_task_var.cancel
+            
             // Force close socket after success page is sent
             log.info "Success page sent, closing server"
-            socket.close
+            exception = catch: socket.close
             
             // Set flag to exit after this request
             should_exit = true
@@ -359,6 +377,12 @@ run_http network_interface/net.Interface access_points/List status_message/strin
       if should_exit: 
         Task.current.cancel
   finally:
+    // Cancel the direct HTTP task explicitly when exiting
+    exception := catch: direct_task_var.cancel
+    
+    // Always close the socket when done
+    log.info "Closing HTTP server socket"
+    exception = catch: socket.close
+    
     if result: return result
-    socket.close
-  unreachable
+    else: return {:}  // Return empty map if no result so we don't get unreachable
