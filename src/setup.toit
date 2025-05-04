@@ -27,7 +27,18 @@ TEMPORARY_REDIRECTS ::= {
   "gen_204": "/",         // Used by Android captive portal detection.
 }
 
-// Simplified HTML to reduce memory usage
+// Simple response for direct detection success
+DIRECT_SUCCESS_RESPONSE ::= """
+HTTP/1.1 200 OK
+Content-Type: text/html
+Cache-Control: no-store
+Connection: close
+Content-Length: 165
+
+<html><head><meta http-equiv="refresh" content="0;url=/index.html" /><title>Success</title></head><body>Success - redirecting to portal...</body></html>
+"""
+
+// Improved HTML with nicer form and dropdown for networks
 INDEX ::= """
 <html>
 <head>
@@ -46,14 +57,27 @@ label{display:block;font-weight:500}
 <body>
 <h1>WiFi Setup</h1>
 <form>
-<label for="ssid">Network Name:</label>
-<input type="text" id="ssid" name="ssid" autocorrect="off" autocapitalize="none">
-<label for="password">Password:</label>
-<input type="password" id="password" name="password" autocorrect="off" autocapitalize="none">
+<label for="nw">Available Networks:</label>
+<select id="nw" name="network" onchange="hNC()">
+<option value="custom">Custom...</option>
+{{network-options}}
+</select>
+<div id="sc">
+<label for="ss">Network Name:</label>
+<input type="text" id="ss" name="ssid" autocorrect="off" autocapitalize="none">
+</div>
+<label for="pw">Password:</label>
+<input type="password" id="pw" name="password" autocorrect="off" autocapitalize="none">
 <input type="submit" class="btn" value="Connect">
 </form>
-<p>Available networks:</p>
-{{access-points}}
+<script>
+function hNC(){
+var d=document.getElementById("nw"),s=document.getElementById("ss"),c=document.getElementById("sc");
+if(d.value==="custom"){s.value="";s.disabled=false;c.classList.remove("hidden")}
+else{s.value=d.value;s.disabled=true;c.classList.add("hidden")}
+}
+window.onload=function(){hNC();}
+</script>
 </body>
 </html>
 """
@@ -137,10 +161,16 @@ run_dns network/net.Interface -> none:
   finally:
     socket.close
 
+// Let's skip the direct responder - it's causing compile issues
+
 run_http network/net.Interface access_points/List -> Map:
+  // Open the TCP socket for HTTP
   socket := network.tcp_listen 80
+  
+  // Use the regular HTTP server
   server := http.Server
   result/Map? := null
+  
   try:
     server.listen socket:: | request writer |
       result = handle_http_request request writer access_points
@@ -168,13 +198,41 @@ handle_http_request request/http.Request writer/http.ResponseWriter access_point
     writer.write "Not found: $resource"
     return null
 
+  // Create the network options dropdown items
+  network_options := access_points.map: | ap |
+    // Mark signal strength
+    signal_strength := "Good"
+    if ap.rssi > -60: signal_strength = "Strong"
+    else if ap.rssi < -75: signal_strength = "Weak"
+    
+    // Build the select option
+    "<option value=\"$(ap.ssid)\">$(ap.ssid) ($signal_strength)</option>"
+  
+  // Set up the HTML content with our substitutions
   substitutions := {
-    "access-points": (access_points.map: "$it.ssid<br>").join "\n"
+    "network-options": network_options.join "\n"
   }
   writer.headers.set "Content-Type" "text/html"
   writer.write (INDEX.substitute: substitutions[it])
 
+  // Check if we have form parameters
   if query.parameters.is_empty: return null
-  ssid := query.parameters["ssid"].trim
-  password := query.parameters["password"].trim
-  return { "ssid": ssid, "password": password }
+  
+  // Handle form submission from dropdown or manual entry
+  ssid := ""
+  
+  // Check if using the dropdown selection
+  network := query.parameters.get "network" --if_absent=: null
+  if network and network != "custom":
+    ssid = network.trim
+  else:
+    // Using manual entry
+    ssid_param := query.parameters.get "ssid" --if_absent=: null
+    if ssid_param: ssid = ssid_param.trim
+  
+  // Get the password
+  password := query.parameters.get "password" --if_absent=: ""
+  
+  // Return if we have valid credentials
+  if ssid != "": return { "ssid": ssid, "password": password }
+  return null

@@ -9,8 +9,8 @@ import ntp
 
 import .mode as mode
 
-RETRIES ::= mode.DEVELOPMENT ? 2 : 5
-PERIOD  ::= mode.DEVELOPMENT ? (Duration --s=10) : (Duration --m=1)
+RETRIES ::= mode.DEVELOPMENT ? 2 : 3
+PERIOD  ::= mode.DEVELOPMENT ? (Duration --s=5) : (Duration --s=10)
 
 main:
   // If the setup container is supposed to run, we allow
