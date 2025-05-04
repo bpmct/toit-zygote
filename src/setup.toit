@@ -22,9 +22,20 @@ MAX_SETUP_TIMEOUT       ::= Duration --m=30  // 30 minutes timeout instead of 15
 MAX_CONNECTION_RETRIES  ::= 3
 
 // Ultra-minimal response for iOS captive portal detection
-// This time include a meta refresh to automatically redirect to the portal
+// Include a meta refresh to automatically redirect to the full portal
 IOS_RESPONSE ::= """
 <html><head><meta http-equiv="refresh" content="0;url=/portal.html" /><title>Success</title></head><body>Success</body></html>
+"""
+
+// Simple response for direct detection success
+DIRECT_SUCCESS_RESPONSE ::= """
+HTTP/1.1 200 OK
+Content-Type: text/html
+Cache-Control: no-store
+Connection: close
+Content-Length: 165
+
+<html><head><meta http-equiv="refresh" content="0;url=/portal.html" /><title>Success</title></head><body>Success - redirecting to portal...</body></html>
 """
 
 // Simplified HTML to reduce memory usage
@@ -176,7 +187,7 @@ direct_http_respond socket/tcp.ServerSocket -> none:
     
     if not client: continue
     
-    // Get peer for logging
+    // Get peer info for logging
     peer := "unknown"
     exception = catch:
       peer = client.peer.to_string
@@ -205,21 +216,13 @@ direct_http_respond socket/tcp.ServerSocket -> none:
         is_ios_detection = true
       
       if is_ios_detection:
-        log.info "Sending direct iOS response"
+        log.info "Sending direct iOS response with auto-redirect"
         
-        // Send a minimal HTTP response directly
-        response := """
-HTTP/1.1 200 OK
-Content-Type: text/html
-Connection: close
-Content-Length: $(IOS_RESPONSE.size)
-
-$IOS_RESPONSE"""
-        
+        // Send a minimal HTTP response with redirect
         exception = catch:
-          client.write response.to_byte_array
+          client.write DIRECT_SUCCESS_RESPONSE.to_byte_array
         
-        log.info "Sent iOS response directly"
+        log.info "Sent iOS response directly with redirect"
       else:
         log.info "Not an iOS detection request, closing"
     
@@ -259,6 +262,7 @@ run_http network_interface/net.Interface access_points/List status_message/strin
   portal_html := INDEX.substitute: substitutions[it]
   
   result := null
+  should_exit := false
   
   try:
     server.listen socket:: | request writer |
@@ -271,14 +275,14 @@ run_http network_interface/net.Interface access_points/List status_message/strin
         
         // Handle iOS captive portal detection (backup for the direct handler)
         if path == "/hotspot-detect.html" or path == "/library/test/success.html":
-          log.info "Sending iOS detection response (from regular server)"
+          log.info "Sending iOS detection response with redirect"
           writer.headers.set "Content-Type" "text/html"
           writer.headers.set "Connection" "close"
           writer.write IOS_RESPONSE
         
-        // Handle the explicit portal page request
-        else if path == "/portal.html":
-          log.info "Showing portal page"
+        // This is the page we redirect to - always show the full portal
+        else if path == "/portal.html" or path == "/" or path == "/index.html":
+          log.info "Showing full portal page"
           writer.headers.set "Content-Type" "text/html"
           writer.headers.set "Cache-Control" "no-store, no-cache"
           writer.write portal_html
@@ -310,9 +314,9 @@ run_http network_interface/net.Interface access_points/List status_message/strin
             result["ssid"] = ssid
             result["password"] = password
             
-            // Show success page
-            writer.headers.set "Content-Type" "text/html"
-            writer.write """
+            // Show success page and ensure it's sent completely
+            log.info "Sending success page for $ssid"
+            success_page := """
 <html><head><title>Connected</title><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <style>body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:100%;padding:20px}
 .s{color:#4CAF50;font-size:24px;margin:20px 0}.m{background:#f8f9fa;padding:15px;margin:15px 0;border-radius:6px}
@@ -325,9 +329,21 @@ run_http network_interface/net.Interface access_points/List status_message/strin
 <p>You'll be disconnected when the device restarts.</p>
 </body></html>
 """
+            writer.headers.set "Content-Type" "text/html"
+            writer.headers.set "Connection" "close"
+            writer.headers.set "Content-Length" "$(success_page.size)"
+            writer.write success_page
+            writer.close
+            
+            // Force close socket after success page is sent
+            log.info "Success page sent, closing server"
             socket.close
+            
+            // Set flag to exit after this request
+            should_exit = true
           else:
             // Show the portal again for invalid submissions
+            log.info "Invalid submission - showing portal page again"
             writer.headers.set "Content-Type" "text/html"
             writer.headers.set "Cache-Control" "no-store, no-cache"
             writer.write portal_html
@@ -338,6 +354,10 @@ run_http network_interface/net.Interface access_points/List status_message/strin
           writer.headers.set "Content-Type" "text/html"
           writer.headers.set "Cache-Control" "no-store, no-cache"
           writer.write portal_html
+      
+      // Break out of listener if needed
+      if should_exit: 
+        Task.current.cancel
   finally:
     if result: return result
     socket.close
