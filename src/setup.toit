@@ -27,149 +27,69 @@ TEMPORARY_REDIRECTS ::= {
   "gen_204": "/",         // Used by Android captive portal detection.
 }
 
+// Simplified HTML to reduce memory usage
 INDEX ::= """
 <html>
-  <head>
-    <title>WiFi settings</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-      body {
-        font-family: Arial, sans-serif;
-        max-width: 600px;
-        margin: 0 auto;
-        padding: 20px;
-      }
-      h1 {
-        color: #333;
-      }
-      form {
-        margin-bottom: 20px;
-      }
-      label {
-        display: block;
-        margin-top: 10px;
-      }
-      select, input[type="text"], input[type="password"] {
-        width: 100%;
-        padding: 8px;
-        margin-top: 5px;
-        box-sizing: border-box;
-        border: 1px solid #ccc;
-        border-radius: 4px;
-      }
-      input[type="submit"] {
-        background-color: #4CAF50;
-        color: white;
-        padding: 10px 15px;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-        margin-top: 15px;
-      }
-      input[type="submit"]:hover {
-        background-color: #45a049;
-      }
-      .checkbox-container {
-        margin-top: 10px;
-      }
-      .status-message {
-        margin-top: 20px;
-        padding: 10px;
-        border-radius: 4px;
-        background-color: #f8f9fa;
-        border-left: 4px solid #17a2b8;
-      }
-      .error {
-        border-left-color: #dc3545;
-      }
-    </style>
-  </head>
-  <body>
-    <h1>Update WiFi settings</h1>
-    {{status-message}}
-    <form id="wifi-form">
-      <label for="network">Select Network:</label>
-      <select id="network" name="network" onchange="handleNetworkChange()">
-        <option value="custom">Custom...</option>
-        {{network-options}}
-      </select>
-      
-      <label for="ssid">SSID:</label>
-      <input type="text" id="ssid" name="ssid" autocorrect="off" autocapitalize="none">
-      
-      <label for="security_type">Security Type:</label>
-      <select id="security_type" name="security_type" onchange="handleSecurityChange()">
-        <option value="password">Password Protected</option>
-        <option value="open">Open Network (No Password)</option>
-      </select>
-      
-      <div id="password_container">
-        <label for="password">Password:</label>
-        <input type="password" id="password" name="password" autocorrect="off" autocapitalize="none">
-      </div>
-      
-      <input type="submit" value="Connect">
-    </form>
-    
-    <script>
-      function handleNetworkChange() {
-        var dropdown = document.getElementById("network");
-        var ssidField = document.getElementById("ssid");
-        
-        if (dropdown.value === "custom") {
-          ssidField.value = "";
-          ssidField.disabled = false;
-        } else {
-          ssidField.value = dropdown.value;
-          ssidField.disabled = true;
-        }
-      }
-      
-      function handleSecurityChange() {
-        var securityType = document.getElementById("security_type");
-        var passwordContainer = document.getElementById("password_container");
-        
-        if (securityType.value === "open") {
-          passwordContainer.style.display = "none";
-        } else {
-          passwordContainer.style.display = "block";
-        }
-      }
-      
-      // Initialize on page load
-      window.onload = function() {
-        handleNetworkChange();
-        handleSecurityChange();
-        
-        // Add form submit handler
-        document.getElementById("wifi-form").addEventListener("submit", function(e) {
-          var dropdown = document.getElementById("network");
-          var ssidField = document.getElementById("ssid");
-          var security = document.getElementById("security_type").value;
-          var password = document.getElementById("password").value;
-          
-          // Make sure ssid field is enabled for submission
-          if (dropdown.value !== "custom") {
-            ssidField.disabled = false;
-            ssidField.value = dropdown.value;
-          }
-          
-          // Basic validation
-          if (!ssidField.value || ssidField.value.trim() === "") {
-            e.preventDefault();
-            alert("Please enter an SSID or select a network");
-            return false;
-          }
-          
-          if (security === "password" && (!password || password.trim() === "")) {
-            e.preventDefault();
-            alert("Please enter a password or select 'Open Network'");
-            return false;
-          }
-        });
-      };
-    </script>
-  </body>
+<head>
+<title>WiFi Setup</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;padding:15px;font-size:16px}
+h1{color:#333;margin-bottom:15px}
+select,input{width:100%;padding:10px;margin:8px 0 15px;border:1px solid #ccc;border-radius:6px;font-size:16px;-webkit-appearance:none;box-sizing:border-box}
+.btn{background:#4CAF50;color:#fff;border:none;border-radius:6px;padding:12px;width:100%;font-size:16px;margin-top:10px;cursor:pointer}
+.msg{padding:10px;margin:10px 0;border-radius:4px;background:#f8f9fa;border-left:3px solid #17a2b8}
+.hidden{display:none}
+label{display:block;font-weight:500}
+@media(max-width:480px){body{padding:10px}}
+</style>
+</head>
+<body>
+<h1>WiFi Setup</h1>
+{{status-message}}
+<form id="wf">
+<label for="nw">Available Networks:</label>
+<select id="nw" name="network" onchange="hNC()">
+<option value="custom">Custom...</option>
+{{network-options}}
+</select>
+<div id="sc">
+<label for="ss">Network Name:</label>
+<input type="text" id="ss" name="ssid" autocorrect="off" autocapitalize="none">
+</div>
+<label for="st">Security:</label>
+<select id="st" name="security_type" onchange="hSC()">
+<option value="password">Password Protected</option>
+<option value="open">Open Network</option>
+</select>
+<div id="pc">
+<label for="pw">Password:</label>
+<input type="password" id="pw" name="password" autocorrect="off" autocapitalize="none">
+</div>
+<input type="submit" class="btn" value="Connect">
+</form>
+<script>
+function hNC(){
+var d=document.getElementById("nw"),s=document.getElementById("ss"),c=document.getElementById("sc");
+if(d.value==="custom"){s.value="";s.disabled=false;c.classList.remove("hidden")}
+else{s.value=d.value;s.disabled=true;c.classList.add("hidden")}
+}
+function hSC(){
+var t=document.getElementById("st"),p=document.getElementById("pc");
+p.style.display=t.value==="open"?"none":"block";
+}
+window.onload=function(){
+hNC();hSC();
+document.getElementById("wf").addEventListener("submit",function(e){
+var d=document.getElementById("nw"),s=document.getElementById("ss"),
+t=document.getElementById("st").value,p=document.getElementById("pw").value;
+if(d.value!=="custom"){s.disabled=false;s.value=d.value}
+if(!s.value||s.value.trim()===""){e.preventDefault();alert("Please enter a network name");return false}
+if(t==="password"&&(!p||p.trim()==="")){e.preventDefault();alert("Please enter a password");return false}
+});
+}
+</script>
+</body>
 </html>
 """
 
@@ -285,13 +205,16 @@ handle_http_request request/http.Request writer/http.ResponseWriter access_point
 
   // Create network options for the dropdown
   network_options := access_points.map: | ap |
-    "<option value=\"$(ap.ssid)\">$(ap.ssid) ($(ap.rssi) dBm)</option>"
-  network_options_string := network_options.join "\n        "
+    str := "Good"
+    if ap.rssi > -60: str = "Strong"
+    else if ap.rssi < -75: str = "Weak"
+    "<option value=\"$(ap.ssid)\">$(ap.ssid) ($str)</option>"
+  network_options_string := network_options.join "\n"
 
-  // Create status message HTML if there is a message
+  // Create status message HTML if there is a message, but keep it minimal
   status_html := ""
   if status_message != "":
-    status_html = """<div class="status-message">$status_message</div>"""
+    status_html = "<div class=\"msg\">$status_message</div>"
 
   substitutions := {
     "network-options": network_options_string,
