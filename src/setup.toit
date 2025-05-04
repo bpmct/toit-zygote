@@ -46,24 +46,28 @@ INDEX ::= """
 <html>
 """
 
+// Add a simple success page HTML
+SUCCESS_PAGE ::= """
+<html>
+  <head>
+    <title>WiFi Setup Complete</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 40px; text-align: center; }
+      h1 { color: #4CAF50; }
+    </style>
+  </head>
+  <body>
+    <h1>WiFi Setup Complete</h1>
+    <p>Connecting to network: <strong>{{ssid}}</strong></p>
+    <p>The device will restart if the connection is successful.</p>
+  </body>
+</html>
+"""
+
 main:
-  // We allow the setup container to start and eagerly terminate
-  // if we don't need it yet. This makes it possible to have
-  // the setup container installed always, but have it run with
-  // the -D jag.disabled flag in development.
+  // We should only run when the device is in setup mode (RUNNING is false)
   if mode.RUNNING: return
-
-  // When running in development we run for less time before we
-  // back to trying out the app. This makes it faster to correct
-  // things and retry, but it does mean that you have less time
-  // to connect to the established WiFi.
-  timeout := mode.DEVELOPMENT ? (Duration --s=30) : (Duration --m=3)
-  catch --unwind=(: it != DEADLINE_EXCEEDED_ERROR): run timeout
-
-  // We're done trying to complete the setup. Go back to running
-  // the application and let it choose when to re-initiate the
-  // setup process.
-  mode.run_application
+  run (Duration --s=900)  // 15 minutes
 
 run timeout/Duration:
   log.info "scanning for wifi access points"
@@ -77,10 +81,17 @@ run timeout/Duration:
         --ssid=CAPTIVE_PORTAL_SSID
         --password=CAPTIVE_PORTAL_PASSWORD
     credentials/Map? := null
+
+    portal_exception := catch:
+      credentials = (with_timeout timeout: run_captive_portal network_ap access_points)
+
+    if portal_exception: log.info "Captive portal timed out, restarting..."
+
     try:
-      with_timeout timeout: credentials = run_captive_portal network_ap access_points
-    finally:
       network_ap.close
+    finally:
+      // Ensure we always continue to the next iteration if no credentials
+      if not credentials: continue
 
     if credentials:
       exception := catch:
@@ -146,13 +157,25 @@ handle_http_request request/http.Request writer/http.ResponseWriter access_point
     writer.write "Not found: $resource"
     return null
 
+  // If there are query parameters, this is likely a submission
+  if not query.parameters.is_empty:
+    ssid := query.parameters["ssid"].trim
+    password := query.parameters["password"].trim
+    
+    if ssid != "" and password != "":
+      // Show success page
+      substitutions := { "ssid": ssid }
+      writer.headers.set "Content-Type" "text/html"
+      writer.write (SUCCESS_PAGE.substitute: substitutions[it])
+      
+      // Return the credentials
+      return { "ssid": ssid, "password": password }
+
+  // Show the main form
   substitutions := {
     "access-points": (access_points.map: "$it.ssid<br>").join "\n"
   }
   writer.headers.set "Content-Type" "text/html"
   writer.write (INDEX.substitute: substitutions[it])
-
-  if query.parameters.is_empty: return null
-  ssid := query.parameters["ssid"].trim
-  password := query.parameters["password"].trim
-  return { "ssid": ssid, "password": password }
+  
+  return null

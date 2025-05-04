@@ -2,8 +2,9 @@
 # Use of this source code is governed by a Zero-Clause BSD license that can
 # be found in the LICENSE file.
 
-CHIP   = esp32
+CHIP ?= esp32
 JAGUAR = $(HOME)/.cache/jaguar
+VERSION = $(shell jag version | grep '^SDK version' | cut -d':' -f2 | xargs)
 
 .PHONY: firmware
 firmware: build/firmware.envelope
@@ -16,9 +17,9 @@ clean:
 
 build/firmware.envelope: build/app.snapshot
 build/firmware.envelope: build/setup.snapshot
-build/firmware.envelope: $(JAGUAR)/assets/firmware-$(CHIP).envelope
+build/firmware.envelope: $(JAGUAR)/$(VERSION)/envelopes/firmware-$(CHIP).envelope
 	mkdir -p $(dir $@)
-	cp $< $@
+	cp $(JAGUAR)/$(VERSION)/envelopes/firmware-$(CHIP).envelope $@
 	$(JAGUAR)/sdk/tools/firmware -e $@ container install app build/app.snapshot
 	$(JAGUAR)/sdk/tools/firmware -e $@ container install setup build/setup.snapshot
 

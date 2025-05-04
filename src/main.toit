@@ -22,16 +22,22 @@ main:
   retries := 0
   while ++retries < RETRIES:
     network/net.Interface? := null
-    exception := catch --trace:
+    exception := catch:
       network = net.open
       run network
       retries = 0
+    if exception:
+      log.warn "WiFi connection attempt failed" --tags={
+        "attempt": retries,
+        "error": exception.to_string
+      }
     if network: network.close
     sleep PERIOD
 
   // We keep failing to connect or run the app. We assume
   // that this is because we've got the wrong WiFi credentials
   // so we enter the setup mode.
+  log.info "All connection attempts failed, entering setup mode"
   mode.run_setup
 
 run network/net.Interface:
