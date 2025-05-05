@@ -427,15 +427,26 @@ run_http network_interface/net.Interface access_points/List status_message/strin
               writer.headers.set "Connection" "close"
               writer.write """
 <html><head><title>Connected</title><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<style>body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:100%;padding:20px}
-.s{color:#4CAF50;font-size:24px;margin:20px 0}.m{background:#f8f9fa;padding:15px;margin:15px 0;border-radius:6px}
-.l{width:30px;height:30px;border:4px solid #eee;border-top:4px solid #4CAF50;border-radius:50%;animation:s 1s infinite linear;margin:20px auto}
-@keyframes s{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>
+<style>
+body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:100%;padding:20px}
+.s{color:#4CAF50;font-size:28px;margin:20px 0;font-weight:bold}
+.m{background:#f8f9fa;padding:20px;margin:20px 0;border-radius:8px;font-size:18px;line-height:1.5}
+.l{width:40px;height:40px;border:5px solid #eee;border-top:5px solid #4CAF50;border-radius:50%;animation:s 1s infinite linear;margin:30px auto}
+@keyframes s{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+.note{color:#666;margin-top:30px;font-size:16px}
+</style>
+<script>
+// Keep the page alive even if the device disconnects
+setTimeout(function() {
+  document.getElementById('status').innerHTML = 'WiFi configuration complete!';
+  document.getElementById('msg').innerHTML = 'Your device has been configured to connect to <b>$ssid</b>.<br>It will now restart and connect to your network.';
+}, 3000);
+</script>
 </head><body>
-<div class="s">WiFi Connected!</div>
-<div class="m">Connected to <b>$ssid</b><br>The device will restart...</div>
+<div id="status" class="s">WiFi Connected!</div>
+<div id="msg" class="m">Connected to <b>$ssid</b><br>Your device is being configured...</div>
 <div class="l"></div>
-<p>You'll be disconnected when the device restarts.</p>
+<p class="note">You'll be disconnected when the device restarts.<br>This page will remain open.</p>
 </body></html>
 """
               // First, send the response to the client so they see the success page
@@ -445,6 +456,10 @@ run_http network_interface/net.Interface access_points/List status_message/strin
               sleep --ms=500
               
               log.info "EMERGENCY APPROACH: Saving credentials and EXITING DIRECTLY"
+              
+              // Give time for the success page to be fully sent
+              log.info ">>> WAITING TO ENSURE SUCCESS PAGE IS DISPLAYED"
+              sleep --ms=1500  // Longer wait for success page
               
               // Store credentials in the flash memory directly
               try_save := catch:
@@ -456,6 +471,9 @@ run_http network_interface/net.Interface access_points/List status_message/strin
                 bucket["ssid"] = ssid
                 bucket["password"] = password
                 log.info ">>> CREDENTIALS SAVED TO STORAGE"
+                
+                log.info ">>> SAVING COMPLETE - WAITING 2 SECONDS BEFORE EXITING SETUP"
+                sleep --ms=2000  // Additional delay to ensure page rendering
                 
                 // Exit directly to application mode WITHOUT trying to connect
                 log.info ">>> CALLING mode.run_application DIRECTLY"
