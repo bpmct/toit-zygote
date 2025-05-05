@@ -5,7 +5,9 @@
 import esp32
 import log
 import net
+import net.wifi
 import ntp
+import system.storage
 
 import .mode as mode
 
@@ -19,10 +21,51 @@ main:
   // interfering with each other.
   if not mode.RUNNING: return
 
+  // First, check if we have saved credentials and need to configure WiFi
+  log.info "*** APPLICATION CONTAINER STARTING ***"
+  
+  // Try to read credentials from storage
+  try_read := catch:
+    bucket := storage.Bucket.open --flash "github.com/kasperl/toit-zygote-wifi"
+    ssid := bucket.get "ssid" --if_absent=: null
+    password := bucket.get "password" --if_absent=: null
+    
+    if ssid and password:
+      
+      // Log that we found credentials (mask password)
+      log.info "*** FOUND SAVED CREDENTIALS - SSID: $ssid ***"
+      
+      // Try to configure WiFi with the saved credentials
+      
+      // Open WiFi with credentials and --save flag to persist to flash memory
+      log.info "*** OPENING WIFI WITH SAVED CREDENTIALS ***"
+      network_sta := wifi.open
+          --save
+          --ssid=ssid
+          --password=password
+      
+      // Wait to ensure credentials are saved to flash
+      log.info "*** WAITING 5 SECONDS FOR WIFI CONNECTION ***"
+      sleep --ms=5000
+      
+      // Close connection properly
+      network_sta.close
+      log.info "*** SAVED WIFI CREDENTIALS TO SYSTEM ***"
+      
+      // Try to clear our bucket to avoid reconfiguring next time
+      log.info "*** CLEARING CUSTOM STORAGE BUCKET ***"
+      bucket.remove "ssid"
+      bucket.remove "password"
+  
+  if try_read:
+    log.info "*** ERROR READING/CONFIGURING SAVED CREDENTIALS: $try_read ***"
+  
+  // Continue with normal WiFi connection attempts
   retries := 0
   while ++retries < RETRIES:
     network/net.Interface? := null
     exception := catch:
+      log.info "*** ATTEMPTING NORMAL WIFI CONNECTION ***"
       network = net.open
       run network
       retries = 0

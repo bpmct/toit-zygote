@@ -5,6 +5,7 @@
 import log
 import monitor
 import encoding.url
+import system.storage
 
 import net
 import net.tcp
@@ -436,23 +437,34 @@ run_http network_interface/net.Interface access_points/List status_message/strin
               // Sleep a bit to ensure the response is sent
               sleep --ms=500
               
-              log.info "MEGA DIRECT APPROACH: Now attempting WiFi connection directly from HTTP handler"
+              log.info "EMERGENCY APPROACH: Saving credentials and EXITING DIRECTLY"
               
-              // Use a task to just close the socket and continue normal flow
-              task::
-                log.info ">>> SOCKET CLOSE TASK STARTED"
-                sleep --ms=500  // Wait for response to be sent
-                exception := catch:
-                  socket.close
-                  log.info ">>> SOCKET CLOSED BY TASK"
+              // Store credentials in the flash memory directly
+              try_save := catch:
+                // Save WiFi credentials to flash storage
+                log.info ">>> SAVING CREDENTIALS DIRECTLY TO STORAGE"
+                
+                // Create a bucket in flash storage
+                bucket := storage.Bucket.open --flash "github.com/kasperl/toit-zygote-wifi"
+                bucket["ssid"] = ssid
+                bucket["password"] = password
+                log.info ">>> CREDENTIALS SAVED TO STORAGE"
+                
+                // Exit directly to application mode WITHOUT trying to connect
+                log.info ">>> CALLING mode.run_application DIRECTLY"
+                mode.run_application
+                
+                log.info ">>> THIS LINE SHOULD NEVER PRINT (AFTER mode.run_application)"
               
-              // Continue with normal HTTP handler flow - the task will handle everything
-              log.info ">>> HTTP HANDLER CONTINUING - WIFI CONFIGURATION RUNNING IN BACKGROUND"
+              if try_save:
+                log.error ">>> ERROR SAVING CREDENTIALS: $try_save"
               
-              // Store credentials in result for the normal flow too (backup approach)
+              // Store credentials in result as backup approach
               result = {:}  // Create empty map
               result["ssid"] = ssid
               result["password"] = password
+              
+              log.info ">>> CONTINUING WITH NORMAL FLOW (FALLBACK)"
           else:
             // Show the portal again for invalid submissions
             writer.headers.set "Content-Type" "text/html"
