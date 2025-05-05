@@ -4,17 +4,13 @@
 
 import log
 import monitor
-
 import encoding.url
-
 import net
 import net.tcp
 import net.udp
 import net.wifi
-
 import http
 import dns_simple_server as dns
-
 import esp32
 import .mode as mode
 
@@ -36,13 +32,16 @@ CAPTIVE_PORTAL_PASSWORD ::= "12345678"
 //
 // This MUST NOT be changed unless thoroughly tested with iOS.
 //
+// This is the response iOS expects for captive portal detection
+// Multiple format options provided - we'll use the simpler one that works
+// Important: The word "Success" must be present for iOS to recognize it
 IOS_SUCCESS_RESPONSE ::= """HTTP/1.1 200 OK
 Content-Type: text/html
 Cache-Control: no-store
 Connection: close
-Content-Length: 165
+Content-Length: 66
 
-<html><head><meta http-equiv="refresh" content="0;url=/index.html" /><title>Success</title></head><body>Success - redirecting to portal...</body></html>
+<html><head><title>Success</title></head><body>Success</body></html>
 """
 
 // Improved HTML with nicer form and dropdown for networks
@@ -159,35 +158,70 @@ run_dns network/net.Interface -> none:
   log.info "DNS server starting with IP: $device_ip_address"
   socket := network.udp_open --port=53
   
-  // Enhanced DNS server implementation
-  port_53_socket := null
   try:
-    // Standard DNS server
+    // Standard UDP DNS server
     hosts := dns.SimpleDnsServer device_ip_address  // Answer the device IP to all queries
-    
-    // Also listen on port 80 for DNS requests (iPhone sometimes uses this for captive portal detection)
-    // When we get a request on port 80, we'll start a TCP server there too
-    port_80_dns := catch:
-      port_53_socket = network.udp_open --port=80
     
     // Main DNS request processing loop
     while not Task.current.is_canceled:
       datagram/udp.Datagram := socket.receive
-      log.info "DNS query received, answering with IP: $device_ip_address"
+      
+      // Fetch the sender info
+      sender_address := datagram.address
+      sender_ip := sender_address.ip.stringify
+      sender_port := sender_address.port
+      
+      log.info "DNS query from $sender_ip:$sender_port - answering with: $device_ip_address"
+      
+      // Extract query name for debugging
+      query_name := "<unknown>"
+      query_name_exception := catch:
+        if datagram.data.size > 12:  // DNS header is 12 bytes
+          // Skip header, count bytes for the name
+          pos := 12
+          while pos < datagram.data.size and datagram.data[pos] != 0:
+            pos++
+          if pos > 12:
+            query_name = extract_dns_name datagram.data 12
+      
+      log.info "DNS query for domain: $query_name"
+      
+      // Look up the response
       response := hosts.lookup datagram.data
       if not response: continue
+      
+      // Send the response
       socket.send (udp.Datagram response datagram.address)
   finally:
-    log.debug "DNS server closing"
+    log.info "DNS server closing"
     socket.close
-    if port_53_socket: port_53_socket.close
 
-// Ultra-simplified HTTP handler focusing on making iOS work
+// Helper to extract domain name from DNS query
+extract_dns_name data/ByteArray offset/int -> string:
+  result := ""
+  pos := offset
+  while pos < data.size:
+    length := data[pos]
+    if length == 0: break  // End of domain name
+    if length >= 192: break  // Compressed pointer, not handling here
+    
+    pos++
+    if pos + length > data.size: break
+    
+    if result != "": result += "."
+    length.repeat:
+      if pos < data.size:
+        // Add the character by its ASCII value
+        result += (data[pos]).stringify
+        pos++
+  
+  return result
+
+// Unified HTTP handler for cross-platform compatibility
 direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
-  log.info "Starting iOS-focused captive portal handler"
+  log.info "Starting unified captive portal handler"
   
   // This is the exact iOS success response content that's known to work
-  // From commit 5094ba88bedfeb902bd9b93042a64e5a30341e42 where iOS worked
   IOS_SUCCESS_BYTES := IOS_SUCCESS_RESPONSE.to_byte_array
    
   while true:
@@ -195,125 +229,266 @@ direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
     client := socket.accept
     
     if client:
-      log.info "Client connection established!"
+      log.info "Client connection established"
       
-      // Debug info
-      log.info "Connection received on HTTP server"
+      // Get client info for better debugging
+      client_ip := "<unknown>"
+      client_port := 0
+      
+      client_info_exception := catch:
+        client_ip = client.peer_address.ip.stringify
+        client_port = client.peer_address.port
+        log.info "Connection from $client_ip:$client_port"
+      
+      if client_info_exception:
+        log.warn "Could not get client info: $client_info_exception"
       
       // We need to make sure to *either* send iOS success OR main page, not both
-      // The problem is that when we send both, browsers show the iOS success page first
+      // Read the request to determine what kind of request it is
       
       // Read a bit of the request to check if it's an iOS detection
-      request_bytes := ByteArray 256
+      request_bytes := ByteArray 1024  // Larger buffer to capture more of the request
       bytes_read := 0
-      read_exception := catch:
+      read_exception := null
+      
+      read_exception = catch:
         in := client.in
         if in:
-          bytes := in.read --max-size=256
+          bytes := in.read --max-size=1024
           if bytes:
             bytes_read = bytes.size
             bytes.size.repeat: | i |
               request_bytes[i] = bytes[i]
       
+      if read_exception:
+        log.warn "Error reading request: $read_exception"
+      
       // Convert to string if we read something
       request_str := ""
       if bytes_read > 0:
         str_exception := catch:
-          request_str = request_bytes.to_string
+          request_str = request_bytes[..bytes_read].to_string
+          
+        if str_exception:
+          log.warn "Error converting request to string: $str_exception"
       
-      // Check if it's an iOS detection request
-      ios_detection := request_str.contains "hotspot-detect.html" or 
-                       request_str.contains "success.html" or
-                       request_str.contains "CaptiveNetworkSupport"
+      // Log the request for debugging
+      if request_str and request_str.size > 0:
+        log_length := request_str.size > 100 ? 100 : request_str.size
+        log.info "Request from $client_ip: $(request_str[..log_length])"
+        
+        // Look for Host header to identify the domain being requested
+        host_idx := request_str.index_of "Host: "
+        if host_idx >= 0:
+          host_end := request_str.index_of "\r\n" host_idx
+          if host_end > host_idx:
+            host := request_str[host_idx + 6..host_end]
+            log.info "Host header: $host"
+      
+      // Enhanced request classification - add the User-Agent for better debugging
+      is_ios_detection := request_str.contains "hotspot-detect" or 
+                          request_str.contains "success.html" or
+                          request_str.contains "captive.apple.com" or
+                          request_str.contains "CaptiveNetworkSupport"
+      
+      // Check for iOS user agent
+      is_ios_device := request_str.contains "iPhone" or
+                       request_str.contains "iPad" or
+                       request_str.contains "Darwin" or
+                       request_str.contains "CFNetwork"
                        
-      if ios_detection:
-        // For iOS detection requests, send the iOS success response
-        log.info "iOS detection request - sending success response"
-        write_exception := catch:
-          client.out.write IOS_SUCCESS_BYTES
-      else:
-        // For all other requests, serve the main setup page
-        log.info "Regular request - serving main page"
-        serve_exception := catch:
-          serve_main_page client access_points
+      is_form_submit := request_str.contains "POST" and request_str.contains "ssid="
       
-      // Long delay to ensure connection stability
-      sleep --ms=1000
+      is_direct_page := request_str.contains "GET / " or
+                        request_str.contains "GET /index.html"
+      
+      // Also check for Android connection test URLs
+      is_android_detection := request_str.contains "generate_204" or
+                              request_str.contains "connectivitycheck" or
+                              request_str.contains "redirect"
+      
+      // Log the detection for detailed debugging
+      log.info "Request analysis: iOS detection=$is_ios_detection, iOS device=$is_ios_device, Android=$is_android_detection, Form=$is_form_submit, Direct=$is_direct_page"
+      
+      if is_ios_detection or (is_ios_device and not is_direct_page and not is_form_submit):
+        // For iOS detection requests, send the iOS success response
+        log.info "iOS detection request - sending iOS success response"
+        ios_exception := catch:
+          client.out.write IOS_SUCCESS_BYTES
+          log.info "iOS success response sent successfully"
+        
+        if ios_exception:
+          log.warn "Error sending iOS response: $ios_exception"
+      
+      else if is_form_submit:
+        // Handle form submission
+        log.info "Form submission - processing credentials"
+        credentials := parse_form_submission request_str
+        if credentials and credentials.get "ssid" --if_absent=(: null):
+          log.info "Valid credentials received"
+          close_exception := catch:
+            client.close
+          
+          if close_exception:
+            log.warn "Error closing socket after credentials: $close_exception"
+          
+          return credentials
+        else:
+          // Invalid form submission - show setup page
+          log.info "Invalid form submission - showing setup page"
+          form_page_exception := catch:
+            serve_main_page client access_points
+          
+          if form_page_exception:
+            log.warn "Error serving page after invalid form: $form_page_exception"
+      
+      else:
+        // For all other requests (including Android and direct page), serve the main setup page
+        log.info "Regular/Android request - serving main page"
+        main_page_exception := catch:
+          serve_main_page client access_points
+        
+        if main_page_exception:
+          log.warn "Error serving main page: $main_page_exception"
+      
+      // Long delay to ensure connection stability - especially important for iOS
+      sleep --ms=1500
       
       close_exception := catch:
         client.close
+        log.info "Connection closed successfully after response"
       
-      sleep --ms=200
+      if close_exception:
+        log.warn "Error closing socket: $close_exception"
       
+      // Additional sleep after closing to prevent immediate reconnection issues
+      sleep --ms=300
+    
     else:
       sleep --ms=10
 
 // Helper to serve the main page
 serve_main_page client/tcp.Socket access_points/List -> none:
   // Create network options HTML
-  network_options := access_points.map: | ap |
-    signal_str := ap.rssi > -60 ? "Strong" : (ap.rssi < -75 ? "Weak" : "Good")
-    "<option value=\"$(ap.ssid)\">$(ap.ssid) ($signal_str)</option>"
+  network_options := []
+  
+  options_exception := catch:
+    network_options = access_points.map: | ap |
+      signal_str := ap.rssi > -60 ? "Strong" : (ap.rssi < -75 ? "Weak" : "Good")
+      "<option value=\"$(ap.ssid)\">$(ap.ssid) ($signal_str)</option>"
+  
+  if options_exception:
+    log.warn "Error creating network options: $options_exception"
+    network_options = ["<option value=\"custom\">Custom network...</option>"]
   
   // Substitute network options into the template
-  content := INDEX.substitute: { "network-options": network_options.join "\n" }
+  content := ""
+  template_exception := catch:
+    content = INDEX.substitute: { "network-options": network_options.join "\n" }
+  
+  if template_exception:
+    log.warn "Error substituting template: $template_exception"
+    content = "<html><body><h1>WiFi Setup</h1><p>Please enter your WiFi details:</p><form method='POST'><input name='ssid'><input name='password' type='password'><input type='submit'></form></body></html>"
   
   // Create HTTP response with the content
   headers := """HTTP/1.1 200 OK
 Content-Type: text/html
+Cache-Control: no-cache, no-store, must-revalidate
+Pragma: no-cache
+Expires: 0
 Connection: close
 Content-Length: $(content.size)
 
 """
   
   // Send headers and content
-  exception := catch:
+  serve_exception := catch:
     client.out.write headers.to_byte_array
     client.out.write content.to_byte_array
+    log.info "Main page served successfully"
+  
+  if serve_exception:
+    log.warn "Error sending main page: $serve_exception"
 
-// Helper to parse form submissions
+// Helper to parse form submissions with improved error handling
 parse_form_submission request_str/string -> Map?:
-  // Check if we have form data
-  form_data_start := request_str.index_of "\r\n\r\n"
-  if form_data_start < 0: 
-    form_data_start = request_str.index_of "ssid="
-    if form_data_start < 0: return null
-  else:
-    form_data_start += 4  // Skip the \r\n\r\n
+  result := null
   
-  // Extract the form data
-  form_data := request_str[form_data_start..]
+  parse_exception := catch:
+    // Check if we have form data - look for the standard delimiter first
+    form_data_start := request_str.index_of "\r\n\r\n"
+    if form_data_start < 0: 
+      // If we can't find the header delimiter, try looking directly for form data
+      form_data_start = request_str.index_of "ssid="
+      if form_data_start < 0:
+        form_data_start = request_str.index_of "network="
+        if form_data_start < 0:
+          log.warn "No form data found in request"
+          return null
+    else:
+      form_data_start += 4  // Skip the \r\n\r\n
+    
+    // Extract the form data
+    form_data := request_str[form_data_start..]
+    
+    // Log what we found for debugging
+    log.info "Form data (first 30 chars): $(form_data.size > 30 ? form_data[..30] + "..." : form_data)"
+    
+    // Extract parameters
+    params := {:}
+    
+    // First try to split by & for normal form encoding
+    pairs := form_data.split "&"
+    pairs.do: | pair |
+      key_value := pair.split "="
+      if key_value.size == 2:
+        key := key_value[0]
+        value := key_value[1]
+        // Simple URL decoding
+        value = decode_url_component value
+        params[key] = value
+    
+    // Log the parameters
+    log.info "Found $(params.size) parameters in form submission"
+    
+    // Extract SSID (either from network dropdown or direct input)
+    ssid := ""
+    
+    // Get SSID from network dropdown if present
+    network := params.get "network" --if_absent=(: null)
+    if network and network != "custom":
+      ssid = network
+      log.info "Using network selection: $ssid"
+    else:
+      // Otherwise get from ssid field
+      ssid_param := params.get "ssid" --if_absent=(: null)
+      if ssid_param: 
+        ssid = ssid_param
+        log.info "Using SSID from form: $ssid"
+    
+    // Get password
+    password := params.get "password" --if_absent=(: "")
+    
+    // Truncate password for logging (show first 3 chars if any)
+    log_password := password.size > 0 ? password[..min 3 password.size] + "..." : "<empty>"
+    log.info "Password: $log_password"
+    
+    // Set credentials if valid
+    if ssid and ssid != "": 
+      log.info "Valid credentials found: SSID=$ssid"
+      result = { "ssid": ssid, "password": password }
+    else:
+      log.warn "Missing or invalid SSID"
   
-  // Extract parameters
-  params := {:}
-  pairs := form_data.split "&"
-  pairs.do: | pair |
-    key_value := pair.split "="
-    if key_value.size == 2:
-      key := key_value[0]
-      value := key_value[1]
-      // Simple URL decoding
-      value = value.replace "+" " "
-      params[key] = value
+  if parse_exception:
+    log.warn "Error parsing form submission: $parse_exception"
   
-  // Extract SSID (either from network dropdown or direct input)
-  ssid := ""
-  
-  // Get SSID from network dropdown if present
-  network := params.get "network" --if_absent=(: null)
-  if network and network != "custom":
-    ssid = network
-  else:
-    // Otherwise get from ssid field
-    ssid_param := params.get "ssid" --if_absent=(: null)
-    if ssid_param: ssid = ssid_param
-  
-  // Get password
-  password := params.get "password" --if_absent=(: "")
-  
-  // Return credentials if valid
-  if ssid and ssid != "": return { "ssid": ssid, "password": password }
-  return null
+  return result
+
+// Custom URL decoder function for form parameters
+decode_url_component str/string -> string:
+  // Simple URL decoding - just handle + for now
+  return str.replace "+" " "
 
 run_http network/net.Interface access_points/List -> Map:
   log.info "Starting captive portal web server"
