@@ -21,6 +21,9 @@ CAPTIVE_PORTAL_PASSWORD ::= "12345678"
 MAX_SETUP_TIMEOUT       ::= Duration --m=30  // 30 minutes timeout instead of 15
 MAX_CONNECTION_RETRIES  ::= 3
 
+// Global variable to share credentials between tasks
+GLOBAL_CREDENTIALS/Map? := null
+
 // Ultra-minimal response for iOS captive portal detection
 // This time include a meta refresh to automatically redirect to the portal
 IOS_RESPONSE ::= """
@@ -90,85 +93,135 @@ main:
   run MAX_SETUP_TIMEOUT  // Use the longer timeout constant
 
 run timeout/Duration:
-  log.info "scanning for wifi access points"
+  log.info "*** STARTING DIRECT WIFI CONFIG FLOW ***"
   channels := ByteArray 12: it + 1
   access_points := wifi.scan channels
   access_points.sort --in_place: | a b | b.rssi.compare_to a.rssi
 
   log.info "establishing wifi in AP mode ($CAPTIVE_PORTAL_SSID)"
-  status_message := ""
   
-  while true:
+  // ADDING GLOBAL CREDENTIALS HOLDER
+  GLOBAL_CREDENTIALS = null
+  
+  captive_portal_task := task::
+    log.info ">>> STARTING CAPTIVE PORTAL TASK"
+    
+    // Setup AP mode network
     network_ap := wifi.establish
         --ssid=CAPTIVE_PORTAL_SSID
         --password=CAPTIVE_PORTAL_PASSWORD
-    credentials/Map? := null
-
+    log.info ">>> AP MODE ESTABLISHED IN BACKGROUND TASK"
+    
+    // Run captive portal
+    log.info ">>> RUNNING CAPTIVE PORTAL IN BACKGROUND TASK"
+    credentials := null
+    
     portal_exception := catch:
-      credentials = (with_timeout timeout: run_captive_portal network_ap access_points status_message)
-
-    if portal_exception: 
-      log.info "Captive portal exception: $portal_exception"
-      status_message = "Connection attempt timed out. Please try again."
-
-    try:
+      credentials = run_captive_portal network_ap access_points ""
+    
+    log.info ">>> CAPTIVE PORTAL FINISHED IN BACKGROUND TASK"
+    
+    if portal_exception:
+      log.info ">>> CAPTIVE PORTAL EXCEPTION: $portal_exception"
+    
+    // Clean up AP mode
+    log.info ">>> CLOSING AP MODE IN BACKGROUND TASK"
+    close_exception := catch:
       network_ap.close
-    finally:
-      // Ensure we always continue to the next iteration if no credentials
-      if not credentials: continue
-
+      log.info ">>> AP MODE CLOSED SUCCESSFULLY IN BACKGROUND TASK"
+    
+    if close_exception:
+      log.error ">>> ERROR CLOSING AP MODE IN BACKGROUND TASK: $close_exception"
+    
+    // If we have credentials, store them globally
     if credentials:
-      retry_count := 0
-      connected := false
-      
-      log.info "*** STARTING WIFI CONNECTION PROCESS ***"
-      while retry_count < MAX_CONNECTION_RETRIES and not connected:
-        log.info "*** CONNECTION ATTEMPT $(retry_count + 1) ***"
-        exception := catch:
-          log.info "Opening WiFi in STA mode with credentials" --tags=credentials
-          
-          // Open WiFi connection with --save flag to ensure credentials are stored in flash
-          network_sta := wifi.open
-              --save    // CRITICAL: This ensures credentials persist after reboot
-              --ssid=credentials["ssid"]
-              --password=credentials["password"]
-          
-          // Log network details if connected
-          log.info "WiFi connected, address: $(network_sta.address)"
-          
-          // Wait to make sure credentials are saved to flash
-          log.info "Waiting 5 seconds to ensure credentials are saved..."
-          sleep --ms=5000
-          
-          // Close the connection properly
-          log.info "Closing WiFi connection"
-          network_sta.close
-          
-          log.info "WiFi credentials saved successfully" --tags=credentials
-          connected = true
-          
-          // Success - return to main function
-          log.info "*** CONNECTION SUCCESSFUL - RETURNING TO MAIN ***"
-          return
+      log.info ">>> STORING CREDENTIALS GLOBALLY IN BACKGROUND TASK"
+      GLOBAL_CREDENTIALS = credentials
+  
+  // Wait for credentials to be acquired from captive portal
+  max_wait_time_ms := 300000  // 5 minutes in ms
+  interval := 100  // Check every 100ms
+  iterations := max_wait_time_ms / interval
+  
+  log.info ">>> MAIN THREAD WAITING FOR CREDENTIALS (MAX WAIT: $max_wait_time_ms MS)"
+  
+  i := 0
+  while i < iterations:
+    if GLOBAL_CREDENTIALS:
+      log.info ">>> CREDENTIALS RECEIVED IN MAIN THREAD"
+      break
+    
+    sleep --ms=interval
+    log.info ">>> WAITING FOR CREDENTIALS..."
+    i++
+  
+  // If we didn't get credentials, exit setup
+  if not GLOBAL_CREDENTIALS:
+    log.info ">>> NO CREDENTIALS RECEIVED, EXITING SETUP"
+    return
+  
+  // We have credentials! Use them to connect
+  credentials := GLOBAL_CREDENTIALS
+  ssid := credentials["ssid"]
+  password := credentials["password"]
+  
+  log.info ">>> CREDENTIALS RECEIVED, CONNECTING TO WIFI: $ssid"
+  
+  wifi_exception := catch:
+    log.info ">>> OPENING WIFI IN STA MODE"
+    
+    // Open WiFi with credentials and --save flag to persist to flash memory
+    network_sta := wifi.open
+        --save
+        --ssid=ssid
+        --password=password
+    
+    // Log connection status if successful
+    log.info ">>> WIFI CONNECTION ESTABLISHED SUCCESSFULLY"
         
-        if exception:
-          log.warn "WiFi connection failed (attempt $(retry_count + 1)): $exception" --tags=credentials
-          retry_count++
-          
-          // Create a status message with the SSID from credentials
-          ssid := credentials["ssid"]
-          status_message = "Failed to connect to $ssid. Please check your credentials and try again."
-          
-          // Short sleep before retrying
-          log.info "Waiting 2 seconds before retry..."
-          sleep --ms=2000
+    // Wait to ensure credentials are saved to flash
+    log.info ">>> WAITING 5 SECONDS TO ENSURE CREDENTIALS ARE SAVED..."
+    sleep --ms=5000
+    
+    // Close connection properly
+    network_sta.close
+    log.info ">>> WIFI CONNECTION SAVED SUCCESSFULLY"
+    
+    // Exit setup mode and return to application container
+    log.info ">>> WIFI SETUP COMPLETE - RETURNING TO APPLICATION MODE"
+    mode.run_application
+    
+    log.info ">>> THIS LINE SHOULD NEVER PRINT - EXECUTION SHOULD BE TERMINATED BY mode.run_application"
+  
+  if wifi_exception:
+    log.error ">>> WIFI CONNECTION FAILED: $wifi_exception"
 
 run_captive_portal network/net.Interface access_points/List status_message/string="" -> Map:
+  log.info "Starting captive portal with DNS and HTTP servers"
+  
+  log.info ">>> STARTING TASK GROUP WITH DNS AND HTTP SERVERS"
+  // Start DNS and HTTP servers as parallel tasks
   results := Task.group --required=1 [
     :: run_dns network,
     :: run_http network access_points status_message,
   ]
-  return results[1]  // Return the result from the HTTP server at index 1.
+  
+  log.info ">>> TASK GROUP COMPLETED"
+  
+  // The HTTP server will return credentials when form is submitted
+  credentials := results[1]
+  log.info ">>> EXTRACTED CREDENTIALS FROM HTTP SERVER RESULT"
+  
+  // Log what we received from the HTTP server
+  if credentials:
+    log.info "*** CAPTIVE PORTAL RECEIVED CREDENTIALS ***"
+    log.info "Credentials: SSID=$(credentials["ssid"]), password length=$(credentials["password"].size)"
+    log.info ">>> RETURNING CREDENTIALS FROM run_captive_portal TO main run FUNCTION"
+  else:
+    log.warn "Captive portal did not receive any credentials"
+  
+  // Return the credentials to the main run function
+  return credentials
 
 run_dns network/net.Interface -> none:
   device_ip_address := network.address
@@ -250,6 +303,9 @@ $IOS_RESPONSE"""
         client.close
 
 run_http network_interface/net.Interface access_points/List status_message/string="" -> Map:
+  log.info "*** SIMPLIFIED HTTP SERVER STARTING ***"
+  
+  // Open TCP socket on port 80
   socket := network_interface.tcp_listen 80
   
   // Start a task that directly handles captive portal detection
@@ -257,32 +313,59 @@ run_http network_interface/net.Interface access_points/List status_message/strin
   task::
     direct_http_respond socket
   
-  // Now start the regular server with slightly delayed execution
-  // to allow the direct responder to handle initial iOS requests
+  // A short delay to allow the direct responder to initialize
   sleep --ms=100
   
+  // Create the HTTP server
   server := http.Server
   
-  log.info "HTTP server starting"
-  
-  // Create network options HTML
+  // Create network options HTML for the dropdown
   network_options := access_points.map: | ap |
     str := "Good"
     if ap.rssi > -60: str = "Strong"
     else if ap.rssi < -75: str = "Weak"
     "<option value=\"$(ap.ssid)\">$(ap.ssid) ($str)</option>"
   
-  // Prepare the main portal page HTML
+  // Prepare the main portal page HTML with substitutions
   substitutions := {
     "network-options": network_options.join "\n",
     "status-message": status_message != "" ? "<div class=\"msg\">$status_message</div>" : ""
   }
+  
+  // Substitute values into the template
   portal_html := INDEX.substitute: substitutions[it]
   
+  // Initialize the result map that will hold credentials when available
   result := null
   
+  log.info "Starting HTTP server loop - waiting for form submission"
+  
+  // Create a flag to indicate if we have a form submission
+  have_form_submission := false
+  
+  // Start a background task to check for form submission and force socket closure
+  cancel_task := task::
+    log.info ">>> STARTING FORM SUBMISSION MONITORING TASK"
+    while true:
+      if have_form_submission:
+        log.info ">>> FORM SUBMISSION DETECTED - FORCE CLOSING SOCKET"
+        error := catch:
+          socket.close
+          log.info ">>> MONITORING TASK: SOCKET CLOSED SUCCESSFULLY"
+        
+        if error:
+          log.error ">>> MONITORING TASK: FAILED TO CLOSE SOCKET: $error"
+        
+        log.info ">>> MONITORING TASK COMPLETED"
+        break
+      
+      // Check every 100ms
+      sleep --ms=100
+  
   try:
+    // Start the HTTP server and handle requests
     server.listen socket:: | request writer |
+      // Skip flag checking here - now handled by background task
       // Skip processing connect requests
       if request.method == "CONNECT":
         log.debug "Skipping CONNECT request"
@@ -304,37 +387,37 @@ run_http network_interface/net.Interface access_points/List status_message/strin
           writer.headers.set "Cache-Control" "no-store, no-cache"
           writer.write portal_html
         
-        // Handle form submission
+        // Handle form submission - DIRECT CONFIGURATION APPROACH
         else if path.contains "?":
+          log.info "Form submission detected - using direct configuration approach"
+          
+          // Parse the query parameters
           query := url.QueryString.parse path
           
-          // Get SSID from network parameter or ssid parameter
-          ssid := ""
-          wifi_network := query.parameters.get "network" --if_absent=: null
-          if wifi_network and wifi_network != "custom":
-            ssid = wifi_network.trim
-          else:
-            ssid_param := query.parameters.get "ssid" --if_absent=: null
-            if ssid_param: ssid = ssid_param.trim
-          
-          if ssid != "":
-            // Get password if needed
-            password := ""
-            security := query.parameters.get "security_type" --if_absent=: "password"
-            if security != "open":
-              pwd := query.parameters.get "password" --if_absent=: null
-              if pwd: password = pwd.trim
+          // Check if we have form parameters
+          if not query.parameters.is_empty:
+            // Extract SSID - first from network dropdown, then from ssid field
+            ssid := ""
+            wifi_network := query.parameters.get "network" --if_absent=: null
+            if wifi_network and wifi_network != "custom":
+              ssid = wifi_network.trim
+            else:
+              ssid_param := query.parameters.get "ssid" --if_absent=: null
+              if ssid_param: ssid = ssid_param.trim
             
-            // Return the credentials
-            log.info "Form submitted - ssid: $ssid, closing socket and returning credentials"
-            result = {:}
-            result["ssid"] = ssid
-            result["password"] = password
+            // Extract password
+            password := query.parameters.get "password" --if_absent=: ""
+            if password: password = password.trim
             
-            // Show success page
-            writer.headers.set "Content-Type" "text/html"
-            writer.headers.set "Connection" "close"  // Ensure connection is closed
-            writer.write """
+            // If we have a valid SSID, prepare to return credentials
+            if ssid and ssid != "":
+              log.info "Form submitted - valid credentials found: SSID=$ssid, password length=$(password.size)"
+              
+              // Send the success page to the browser first
+              log.info "Sending success page to browser"
+              writer.headers.set "Content-Type" "text/html"
+              writer.headers.set "Connection" "close"
+              writer.write """
 <html><head><title>Connected</title><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <style>body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:100%;padding:20px}
 .s{color:#4CAF50;font-size:24px;margin:20px 0}.m{background:#f8f9fa;padding:15px;margin:15px 0;border-radius:6px}
@@ -347,10 +430,29 @@ run_http network_interface/net.Interface access_points/List status_message/strin
 <p>You'll be disconnected when the device restarts.</p>
 </body></html>
 """
-            log.info "Closing socket immediately after form submission"
-            
-            // Force server.listen to exit by closing the socket
-            socket.close
+              // First, send the response to the client so they see the success page
+              log.info "Sending success page to browser and waiting for it to complete..."
+              
+              // Sleep a bit to ensure the response is sent
+              sleep --ms=500
+              
+              log.info "MEGA DIRECT APPROACH: Now attempting WiFi connection directly from HTTP handler"
+              
+              // Use a task to just close the socket and continue normal flow
+              task::
+                log.info ">>> SOCKET CLOSE TASK STARTED"
+                sleep --ms=500  // Wait for response to be sent
+                exception := catch:
+                  socket.close
+                  log.info ">>> SOCKET CLOSED BY TASK"
+              
+              // Continue with normal HTTP handler flow - the task will handle everything
+              log.info ">>> HTTP HANDLER CONTINUING - WIFI CONFIGURATION RUNNING IN BACKGROUND"
+              
+              // Store credentials in result for the normal flow too (backup approach)
+              result = {:}  // Create empty map
+              result["ssid"] = ssid
+              result["password"] = password
           else:
             // Show the portal again for invalid submissions
             writer.headers.set "Content-Type" "text/html"
@@ -364,6 +466,19 @@ run_http network_interface/net.Interface access_points/List status_message/strin
           writer.headers.set "Cache-Control" "no-store, no-cache"
           writer.write portal_html
   finally:
-    if result: return result
+    // If we have credentials, return them immediately
+    if result:
+      log.info "*** FORM SUBMISSION COMPLETE: RETURNING CREDENTIALS ***"
+      log.info "Credentials: SSID=$(result["ssid"]), password length=$(result["password"].size)"
+      log.info ">>> HTTP SERVER EXITING - RETURNING CREDENTIALS TO run_captive_portal"
+      
+      // This is the most important part - return credentials to run_captive_portal
+      return result
+    
+    // Otherwise, just close the socket and return
     socket.close
+    log.info "HTTP server closed without receiving credentials"
+  
+  // This line should not be reached
+  log.warn "HTTP server exited without results - this should not happen"
   unreachable
