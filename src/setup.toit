@@ -160,7 +160,8 @@ run timeout/Duration:
       break
     
     sleep --ms=interval
-    log.info ">>> WAITING FOR CREDENTIALS..."
+    // Horrible SPAM
+    // log.info ">>> WAITING FOR CREDENTIALS..."
     i++
   
   // If we didn't get credentials, exit setup
