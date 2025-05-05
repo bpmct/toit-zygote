@@ -25,23 +25,26 @@ CAPTIVE_PORTAL_PASSWORD ::= "12345678"
 // 
 // iOS captive portal detection specifically looks for this exact
 // format for the success response with these exact headers.
+// The word "Success" must be present for iOS to recognize it.
 // 
 // Detection endpoints: 
 // - /hotspot-detect.html
 // - /success.html
+// - captive.apple.com
 //
+// Using keep-alive connection to allow both responses
 // This MUST NOT be changed unless thoroughly tested with iOS.
-//
-// This is the response iOS expects for captive portal detection
-// Multiple format options provided - we'll use the simpler one that works
-// Important: The word "Success" must be present for iOS to recognize it
-IOS_SUCCESS_RESPONSE ::= """HTTP/1.1 200 OK
+// The response that worked in commit e326b49
+// Changed to use a 302 redirect instead of meta refresh
+// This should directly tell iOS to open the setup page
+IOS_SUCCESS_RESPONSE ::= """HTTP/1.1 302 Found
+Location: http://setup.wifi/
 Content-Type: text/html
 Cache-Control: no-store
 Connection: close
-Content-Length: 66
+Content-Length: 55
 
-<html><head><title>Success</title></head><body>Success</body></html>
+<html><head><title>Found</title></head><body>Found</body></html>
 """
 
 // Improved HTML with nicer form and dropdown for networks
@@ -300,27 +303,19 @@ direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
       is_form_submit := request_str.contains "POST" and request_str.contains "ssid="
       
       is_direct_page := request_str.contains "GET / " or
-                        request_str.contains "GET /index.html"
+                        request_str.contains "GET /index.html" or
+                        request_str.contains "GET /success.html"
       
       // Also check for Android connection test URLs
       is_android_detection := request_str.contains "generate_204" or
                               request_str.contains "connectivitycheck" or
                               request_str.contains "redirect"
       
-      // Log the detection for detailed debugging
-      log.info "Request analysis: iOS detection=$is_ios_detection, iOS device=$is_ios_device, Android=$is_android_detection, Form=$is_form_submit, Direct=$is_direct_page"
+      // Simple logging for request analysis
+      log.info "Request analysis: iOS=$is_ios_detection, Form=$is_form_submit"
       
-      if is_ios_detection or (is_ios_device and not is_direct_page and not is_form_submit):
-        // For iOS detection requests, send the iOS success response
-        log.info "iOS detection request - sending iOS success response"
-        ios_exception := catch:
-          client.out.write IOS_SUCCESS_BYTES
-          log.info "iOS success response sent successfully"
-        
-        if ios_exception:
-          log.warn "Error sending iOS response: $ios_exception"
-      
-      else if is_form_submit:
+      // Process form submissions first
+      if is_form_submit:
         // Handle form submission
         log.info "Form submission - processing credentials"
         credentials := parse_form_submission request_str
@@ -333,20 +328,25 @@ direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
             log.warn "Error closing socket after credentials: $close_exception"
           
           return credentials
-        else:
-          // Invalid form submission - show setup page
-          log.info "Invalid form submission - showing setup page"
-          form_page_exception := catch:
-            serve_main_page client access_points
-          
-          if form_page_exception:
-            log.warn "Error serving page after invalid form: $form_page_exception"
       
+      // For ALL requests except form submissions
+      // Send the appropriate response based on device type
+      
+      // Check if it's an iOS detection request
+      if is_ios_detection or (request_str.contains "captive.apple.com") or (request_str.contains "hotspot-detect"):
+        log.info "For iOS device: sending success response"
+        ios_exception := catch:
+          client.out.write IOS_SUCCESS_BYTES
+          log.info "iOS success response sent successfully"
+        
+        if ios_exception:
+          log.warn "Error sending iOS response: $ios_exception"
+      // For all other devices (Android, browsers)
       else:
-        // For all other requests (including Android and direct page), serve the main setup page
-        log.info "Regular/Android request - serving main page"
+        log.info "For other device: serving main page directly"
         main_page_exception := catch:
-          serve_main_page client access_points
+          serve_main_page client access_points null
+          log.info "Main page sent directly"
         
         if main_page_exception:
           log.warn "Error serving main page: $main_page_exception"
@@ -368,7 +368,7 @@ direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
       sleep --ms=10
 
 // Helper to serve the main page
-serve_main_page client/tcp.Socket access_points/List -> none:
+serve_main_page client/tcp.Socket access_points/List request_str/string? -> none:
   // Create network options HTML
   network_options := []
   
@@ -390,21 +390,22 @@ serve_main_page client/tcp.Socket access_points/List -> none:
     log.warn "Error substituting template: $template_exception"
     content = "<html><body><h1>WiFi Setup</h1><p>Please enter your WiFi details:</p><form method='POST'><input name='ssid'><input name='password' type='password'><input type='submit'></form></body></html>"
   
-  // Create HTTP response with the content
+  // Calculate content length precisely
+  content_bytes := content.to_byte_array
+  content_length := content_bytes.size
+  
+  // Create HTTP response with the content - SIMPLE HEADERS  
   headers := """HTTP/1.1 200 OK
 Content-Type: text/html
-Cache-Control: no-cache, no-store, must-revalidate
-Pragma: no-cache
-Expires: 0
 Connection: close
-Content-Length: $(content.size)
+Content-Length: $content_length
 
 """
   
   // Send headers and content
   serve_exception := catch:
     client.out.write headers.to_byte_array
-    client.out.write content.to_byte_array
+    client.out.write content_bytes
     log.info "Main page served successfully"
   
   if serve_exception:
