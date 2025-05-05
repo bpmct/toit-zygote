@@ -21,38 +21,93 @@ import .mode as mode
 CAPTIVE_PORTAL_SSID     ::= "mywifi"
 CAPTIVE_PORTAL_PASSWORD ::= "12345678"
 
-// A minimal HTML page that will work on any device
-MINIMAL_SETUP_PAGE ::= """
+//-------------------------------------------------------------------------
+// Platform-specific captive portal detection handling
+//-------------------------------------------------------------------------
+
+// ----- iOS CAPTIVE PORTAL DETECTION -----
+// 
+// iOS captive portal detection specifically looks for this exact
+// format for the success response with these exact headers.
+// 
+// Detection endpoints: 
+// - /hotspot-detect.html
+// - /success.html
+//
+// This MUST NOT be changed unless thoroughly tested with iOS.
+//
+IOS_SUCCESS_RESPONSE ::= """HTTP/1.1 200 OK
+Content-Type: text/html
+Cache-Control: no-store
+Connection: close
+Content-Length: 165
+
+<html><head><meta http-equiv="refresh" content="0;url=/index.html" /><title>Success</title></head><body>Success - redirecting to portal...</body></html>
+"""
+
+// Improved HTML with nicer form and dropdown for networks
+INDEX ::= """
 <html>
 <head>
 <title>WiFi Setup</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <style>
-body { font-family: sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; }
-h1 { color: #333; }
-label { display: block; margin-top: 15px; font-weight: bold; }
-input, select { width: 100%; padding: 8px; margin-top: 5px; border: 1px solid #ccc; border-radius: 4px; }
-input[type=submit] { background-color: #4CAF50; color: white; border: none; cursor: pointer; margin-top: 20px; }
-input[type=submit]:hover { background-color: #45a049; }
+body{font-family:system-ui,-apple-system,sans-serif;max-width:600px;margin:0 auto;padding:15px;font-size:16px}
+h1{color:#333;margin-bottom:15px}
+select,input{width:100%;padding:10px;margin:8px 0 15px;border:1px solid #ccc;border-radius:6px;font-size:16px;-webkit-appearance:none;box-sizing:border-box}
+.btn{background:#4CAF50;color:#fff;border:none;border-radius:6px;padding:12px;width:100%;font-size:16px;margin-top:10px;cursor:pointer}
+.hidden{display:none}
+label{display:block;font-weight:500}
+@media(max-width:480px){body{padding:10px}}
 </style>
 </head>
 <body>
 <h1>WiFi Setup</h1>
 <form method="POST" action="/">
-<label for="ssid">WiFi Name:</label>
-<input type="text" id="ssid" name="ssid">
-<label for="password">Password:</label>
-<input type="password" id="password" name="password">
-<input type="submit" value="Connect">
+<label for="nw">Available Networks:</label>
+<select id="nw" name="network" onchange="hNC()">
+<option value="custom">Custom...</option>
+{{network-options}}
+</select>
+<div id="sc">
+<label for="ss">Network Name:</label>
+<input type="text" id="ss" name="ssid" autocorrect="off" autocapitalize="none">
+</div>
+<label for="pw">Password:</label>
+<input type="password" id="pw" name="password" autocorrect="off" autocapitalize="none">
+<input type="submit" class="btn" value="Connect">
 </form>
+<script>
+function hNC(){
+var d=document.getElementById("nw"),s=document.getElementById("ss"),c=document.getElementById("sc");
+if(d.value==="custom"){s.value="";s.disabled=false;c.classList.remove("hidden")}
+else{s.value=d.value;s.disabled=true;c.classList.add("hidden")}
+}
+window.onload=function(){hNC();}
+</script>
 </body>
 </html>
 """
 
 main:
+  // We allow the setup container to start and eagerly terminate
+  // if we don't need it yet. This makes it possible to have
+  // the setup container installed always, but have it run with
+  // the -D jag.disabled flag in development.
   if mode.RUNNING: return
+
+  // When running in development we run for less time before we
+  // back to trying out the app. This makes it faster to correct
+  // things and retry, but it does mean that you have less time
+  // to connect to the established WiFi.
   timeout := mode.DEVELOPMENT ? (Duration --s=30) : (Duration --m=5)
+  
+  // Use the original catch-unwind approach for stability
   catch --unwind=(: it != DEADLINE_EXCEEDED_ERROR): run timeout
+
+  // We're done trying to complete the setup. Go back to running
+  // the application and let it choose when to re-initiate the
+  // setup process.
   log.info "Setup completed or timed out, returning to application mode"
   mode.run_application
 
@@ -80,10 +135,16 @@ run timeout/Duration:
             --save
             --ssid=credentials["ssid"]
             --password=credentials["password"]
+            
+        // Wait to ensure saved - this is an important fix from the original
         sleep --ms=5000
+        
         network_sta.close
         log.info "WiFi connection saved successfully" --tags=credentials
+        
+        // Return to indicate success to main function
         return
+      
       log.warn "WiFi connection failed" --tags=credentials
 
 run_captive_portal network/net.Interface access_points/List -> Map:
@@ -108,31 +169,15 @@ run_dns network/net.Interface -> none:
       log.debug "Sending DNS response"
       socket.send (udp.Datagram response datagram.address)
   finally:
+    log.debug "DNS server closing"
     socket.close
 
 // Ultra-simplified HTTP handler that serves the setup page for all requests
 direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
-  log.info "Starting ultra-simplified page-serving HTTP handler"
+  log.info "Starting complete captive portal handler"
   
-  // Pre-compute page response
-  setup_page := MINIMAL_SETUP_PAGE
-  headers := """HTTP/1.1 200 OK
-Content-Type: text/html
-Connection: close
-Content-Length: $(setup_page.size)
-
-"""
-  complete_response := (headers + setup_page).to_byte_array
-  
-  // iOS Detection special response
-  IOS_SUCCESS := """HTTP/1.1 200 OK
-Content-Type: text/html
-Cache-Control: no-store
-Connection: close
-Content-Length: 45
-
-<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>
-""".to_byte_array
+  // Precompute iOS success response
+  IOS_SUCCESS_BYTES := IOS_SUCCESS_RESPONSE.to_byte_array
   
   while true:
     log.debug "Waiting for connection..."
@@ -160,57 +205,38 @@ Content-Length: 45
           request_str = request_bytes.to_string
         
         // Check for iOS detection
-        if request_str.contains "hotspot-detect.html" or request_str.contains "success.html":
+        ios_detection := request_str.contains "hotspot-detect.html" or 
+                         request_str.contains "success.html" or
+                         request_str.contains "captive.apple.com"
+                        
+        if ios_detection:
           log.info "iOS detection request"
           write_exception := catch:
-            client.out.write IOS_SUCCESS
+            client.out.write IOS_SUCCESS_BYTES
         
         // Check for form submission
         else if request_str.contains "POST" and request_str.contains "ssid=":
           log.info "Form submission detected"
           
-          // Extract SSID and password (very simple parsing)
-          ssid_start := request_str.index_of "ssid="
-          pw_start := request_str.index_of "password="
+          credentials := parse_form_submission request_str
           
-          if ssid_start >= 0 and pw_start >= 0:
-            // Get the SSID (from ssid= to & or end)
-            ssid_start += 5  // skip "ssid="
-            ssid_end := request_str.index_of "&" ssid_start
-            if ssid_end < 0: ssid_end = request_str.size
-            ssid := request_str[ssid_start..ssid_end]
-            
-            // Get the password (from password= to & or end)
-            pw_start += 9  // skip "password="
-            pw_end := request_str.index_of "&" pw_start
-            if pw_end < 0: pw_end = request_str.size
-            password := request_str[pw_start..pw_end]
-            
-            // Simple URL decoding for plus signs
-            ssid = ssid.replace "+" " "
-            password = password.replace "+" " "
-            
-            // Close connection and return credentials
-            if ssid and ssid != "":
-              log.info "Valid credentials extracted"
-              client.close
-              return { "ssid": ssid, "password": password }
+          if credentials and credentials.get "ssid" --if_absent=(: null):
+            log.info "Valid credentials extracted"
+            client.close
+            return credentials
           
-          // Send page response for invalid form data
-          write_exception := catch:
-            client.out.write complete_response
-          
+          // Serve setup page for invalid credentials
+          serve_main_page client access_points
+        
         // Serve setup page for all other requests
         else:
-          log.info "Regular request - serving setup page"
-          write_exception := catch:
-            client.out.write complete_response
+          log.info "Regular request - serving main page"
+          serve_main_page client access_points
       
-      // For requests with no data, just serve the page
+      // For requests with no data, just serve the main page
       else:
-        log.info "Empty request - serving setup page"
-        write_exception := catch:
-          client.out.write complete_response
+        log.info "Empty request - serving main page"
+        serve_main_page client access_points
       
       // Delay before closing
       sleep --ms=500
@@ -223,7 +249,75 @@ Content-Length: 45
       sleep --ms=100
       
     else:
+      log.debug "No client - retry"
       sleep --ms=10
+
+// Helper to serve the main page
+serve_main_page client/tcp.Socket access_points/List -> none:
+  // Create network options HTML
+  network_options := access_points.map: | ap |
+    signal_str := ap.rssi > -60 ? "Strong" : (ap.rssi < -75 ? "Weak" : "Good")
+    "<option value=\"$(ap.ssid)\">$(ap.ssid) ($signal_str)</option>"
+  
+  // Substitute network options into the template
+  content := INDEX.substitute: { "network-options": network_options.join "\n" }
+  
+  // Create HTTP response with the content
+  headers := """HTTP/1.1 200 OK
+Content-Type: text/html
+Connection: close
+Content-Length: $(content.size)
+
+"""
+  
+  // Send headers and content
+  exception := catch:
+    client.out.write headers.to_byte_array
+    client.out.write content.to_byte_array
+
+// Helper to parse form submissions
+parse_form_submission request_str/string -> Map?:
+  // Check if we have form data
+  form_data_start := request_str.index_of "\r\n\r\n"
+  if form_data_start < 0: 
+    form_data_start = request_str.index_of "ssid="
+    if form_data_start < 0: return null
+  else:
+    form_data_start += 4  // Skip the \r\n\r\n
+  
+  // Extract the form data
+  form_data := request_str[form_data_start..]
+  
+  // Extract parameters
+  params := {:}
+  pairs := form_data.split "&"
+  pairs.do: | pair |
+    key_value := pair.split "="
+    if key_value.size == 2:
+      key := key_value[0]
+      value := key_value[1]
+      // Simple URL decoding
+      value = value.replace "+" " "
+      params[key] = value
+  
+  // Extract SSID (either from network dropdown or direct input)
+  ssid := ""
+  
+  // Get SSID from network dropdown if present
+  network := params.get "network" --if_absent=(: null)
+  if network and network != "custom":
+    ssid = network
+  else:
+    // Otherwise get from ssid field
+    ssid_param := params.get "ssid" --if_absent=(: null)
+    if ssid_param: ssid = ssid_param
+  
+  // Get password
+  password := params.get "password" --if_absent=(: "")
+  
+  // Return credentials if valid
+  if ssid and ssid != "": return { "ssid": ssid, "password": password }
+  return null
 
 run_http network/net.Interface access_points/List -> Map:
   log.info "Starting captive portal web server"
