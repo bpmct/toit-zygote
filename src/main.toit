@@ -11,32 +11,44 @@ import system.storage
 
 import .mode as mode
 
-RETRIES ::= mode.DEVELOPMENT ? 2 : 5
-PERIOD  ::= mode.DEVELOPMENT ? (Duration --s=10) : (Duration --m=1)
+RETRIES ::= mode.DEVELOPMENT ? 2 : 3
+PERIOD  ::= mode.DEVELOPMENT ? (Duration --s=5) : (Duration --s=10)
 
 main:
-  // If the setup container is supposed to run, we allow
-  // the application container to terminate eagerly. This
-  // allows the two containers to always start without
-  // interfering with each other.
-  if not mode.RUNNING: return
+  // First check if we're actually supposed to be running
+  // (This prevents the app from running when the setup container should run)
+  log.info "*** CHECKING IF THIS CONTAINER SHOULD RUN ***"
+  if not mode.RUNNING:
+    log.info "*** NOT IN RUNNING MODE - EXITING APP CONTAINER ***"
+    return
 
   // First, check if we have saved credentials and need to configure WiFi
   log.info "*** APPLICATION CONTAINER STARTING ***"
   
   // Try to read credentials from storage
-  try_read := catch:
-    bucket := storage.Bucket.open --flash "github.com/kasperl/toit-zygote-wifi"
-    ssid := bucket.get "ssid" --if_absent=: null
-    password := bucket.get "password" --if_absent=: null
+  log.info "*** CHECKING FOR SAVED WIFI CREDENTIALS ***"
+  
+  bucket := null
+  ssid := null
+  password := null
+  
+  // First check if we have credentials
+  storage_error := catch:
+    bucket = storage.Bucket.open --flash "github.com/kasperl/toit-zygote-wifi"
+    ssid = bucket.get "ssid" --if_absent=: null
+    password = bucket.get "password" --if_absent=: null
+  
+  if storage_error:
+    log.error "*** ERROR ACCESSING STORAGE: $storage_error ***"
+  
+  // If we don't have credentials, continue normally
+  if not ssid or not password:
+    log.info "*** NO CREDENTIALS FOUND IN STORAGE ***"
+  else:
+    // We have credentials, try to configure WiFi
+    log.info "*** CREDENTIALS FOUND IN STORAGE - SSID: $ssid ***"
     
-    if ssid and password:
-      
-      // Log that we found credentials (mask password)
-      log.info "*** FOUND SAVED CREDENTIALS - SSID: $ssid ***"
-      
-      // Try to configure WiFi with the saved credentials
-      
+    wifi_error := catch:
       // Open WiFi with credentials and --save flag to persist to flash memory
       log.info "*** OPENING WIFI WITH SAVED CREDENTIALS ***"
       network_sta := wifi.open
@@ -56,11 +68,11 @@ main:
       log.info "*** CLEARING CUSTOM STORAGE BUCKET ***"
       bucket.remove "ssid"
       bucket.remove "password"
+    
+    if wifi_error:
+      log.error "*** ERROR CONFIGURING WIFI: $wifi_error ***"
   
-  if try_read:
-    log.info "*** ERROR READING/CONFIGURING SAVED CREDENTIALS: $try_read ***"
-  
-  // Continue with normal WiFi connection attempts
+  // Now continue with normal WiFi connection attempts
   retries := 0
   while ++retries < RETRIES:
     network/net.Interface? := null

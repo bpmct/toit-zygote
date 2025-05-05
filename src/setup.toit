@@ -91,6 +91,13 @@ hNC();hSC();
 """
 
 main:
+  log.info "*** CHECKING IF SETUP CONTAINER SHOULD RUN ***"
+  // Only run setup mode if we are explicitly in setup mode
+  if mode.RUNNING:
+    log.info "*** NOT IN SETUP MODE - EXITING SETUP CONTAINER ***"
+    return
+  
+  log.info "*** SETUP CONTAINER STARTING ***"
   run MAX_SETUP_TIMEOUT  // Use the longer timeout constant
 
 run timeout/Duration:
