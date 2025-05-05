@@ -121,26 +121,47 @@ run timeout/Duration:
       retry_count := 0
       connected := false
       
+      log.info "*** STARTING WIFI CONNECTION PROCESS ***"
       while retry_count < MAX_CONNECTION_RETRIES and not connected:
+        log.info "*** CONNECTION ATTEMPT $(retry_count + 1) ***"
         exception := catch:
-          log.info "connecting to wifi in STA mode (attempt $(retry_count + 1))" --tags=credentials
+          log.info "Opening WiFi in STA mode with credentials" --tags=credentials
+          
+          // Open WiFi connection with --save flag to ensure credentials are stored in flash
           network_sta := wifi.open
-              --save
+              --save    // CRITICAL: This ensures credentials persist after reboot
               --ssid=credentials["ssid"]
               --password=credentials["password"]
+          
+          // Log network details if connected
+          log.info "WiFi connected, address: $(network_sta.address)"
+          
+          // Wait to make sure credentials are saved to flash
+          log.info "Waiting 5 seconds to ensure credentials are saved..."
+          sleep --ms=5000
+          
+          // Close the connection properly
+          log.info "Closing WiFi connection"
           network_sta.close
-          log.info "connecting to wifi in STA mode => success" --tags=credentials
+          
+          log.info "WiFi credentials saved successfully" --tags=credentials
           connected = true
+          
+          // Success - return to main function
+          log.info "*** CONNECTION SUCCESSFUL - RETURNING TO MAIN ***"
           return
         
         if exception:
-          log.warn "connecting to wifi in STA mode => failed (attempt $(retry_count + 1))" --tags=credentials
+          log.warn "WiFi connection failed (attempt $(retry_count + 1)): $exception" --tags=credentials
           retry_count++
+          
           // Create a status message with the SSID from credentials
           ssid := credentials["ssid"]
           status_message = "Failed to connect to $ssid. Please check your credentials and try again."
+          
           // Short sleep before retrying
-          sleep --ms=1000
+          log.info "Waiting 2 seconds before retry..."
+          sleep --ms=2000
 
 run_captive_portal network/net.Interface access_points/List status_message/string="" -> Map:
   results := Task.group --required=1 [
@@ -305,13 +326,14 @@ run_http network_interface/net.Interface access_points/List status_message/strin
               if pwd: password = pwd.trim
             
             // Return the credentials
-            log.info "Form submitted - ssid: $ssid"
+            log.info "Form submitted - ssid: $ssid, closing socket and returning credentials"
             result = {:}
             result["ssid"] = ssid
             result["password"] = password
             
             // Show success page
             writer.headers.set "Content-Type" "text/html"
+            writer.headers.set "Connection" "close"  // Ensure connection is closed
             writer.write """
 <html><head><title>Connected</title><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <style>body{font-family:sans-serif;text-align:center;margin:0 auto;max-width:100%;padding:20px}
@@ -325,6 +347,9 @@ run_http network_interface/net.Interface access_points/List status_message/strin
 <p>You'll be disconnected when the device restarts.</p>
 </body></html>
 """
+            log.info "Closing socket immediately after form submission"
+            
+            // Force server.listen to exit by closing the socket
             socket.close
           else:
             // Show the portal again for invalid submissions
