@@ -200,20 +200,47 @@ direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
       // Debug info
       log.info "Connection received on HTTP server"
       
-      // Send the iOS success response immediately and unconditionally
-      // For iOS devices, this will trigger the captive portal notification
-      // For Android and other devices, this gets them to load the main page
-      exception := catch:
-        client.out.write IOS_SUCCESS_BYTES
+      // We need to make sure to *either* send iOS success OR main page, not both
+      // The problem is that when we send both, browsers show the iOS success page first
       
-      // Always serve the main page for all other requests
-      exception = catch:
-        serve_main_page client access_points
+      // Read a bit of the request to check if it's an iOS detection
+      request_bytes := ByteArray 256
+      bytes_read := 0
+      read_exception := catch:
+        in := client.in
+        if in:
+          bytes := in.read --max-size=256
+          if bytes:
+            bytes_read = bytes.size
+            bytes.size.repeat: | i |
+              request_bytes[i] = bytes[i]
+      
+      // Convert to string if we read something
+      request_str := ""
+      if bytes_read > 0:
+        str_exception := catch:
+          request_str = request_bytes.to_string
+      
+      // Check if it's an iOS detection request
+      ios_detection := request_str.contains "hotspot-detect.html" or 
+                       request_str.contains "success.html" or
+                       request_str.contains "CaptiveNetworkSupport"
+                       
+      if ios_detection:
+        // For iOS detection requests, send the iOS success response
+        log.info "iOS detection request - sending success response"
+        write_exception := catch:
+          client.out.write IOS_SUCCESS_BYTES
+      else:
+        // For all other requests, serve the main setup page
+        log.info "Regular request - serving main page"
+        serve_exception := catch:
+          serve_main_page client access_points
       
       // Long delay to ensure connection stability
       sleep --ms=1000
       
-      exception = catch:
+      close_exception := catch:
         client.close
       
       sleep --ms=200
