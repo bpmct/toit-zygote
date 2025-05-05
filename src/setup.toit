@@ -158,27 +158,38 @@ run_dns network/net.Interface -> none:
   device_ip_address := network.address
   log.info "DNS server starting with IP: $device_ip_address"
   socket := network.udp_open --port=53
-  hosts := dns.SimpleDnsServer device_ip_address  // Answer the device IP to all queries.
-
+  
+  // Enhanced DNS server implementation
+  port_53_socket := null
   try:
+    // Standard DNS server
+    hosts := dns.SimpleDnsServer device_ip_address  // Answer the device IP to all queries
+    
+    // Also listen on port 80 for DNS requests (iPhone sometimes uses this for captive portal detection)
+    // When we get a request on port 80, we'll start a TCP server there too
+    port_80_dns := catch:
+      port_53_socket = network.udp_open --port=80
+    
+    // Main DNS request processing loop
     while not Task.current.is_canceled:
       datagram/udp.Datagram := socket.receive
-      log.debug "DNS query received"
+      log.info "DNS query received, answering with IP: $device_ip_address"
       response := hosts.lookup datagram.data
       if not response: continue
-      log.debug "Sending DNS response"
       socket.send (udp.Datagram response datagram.address)
   finally:
     log.debug "DNS server closing"
     socket.close
+    if port_53_socket: port_53_socket.close
 
-// Ultra-simplified HTTP handler that serves the setup page for all requests
+// Ultra-simplified HTTP handler focusing on making iOS work
 direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
-  log.info "Starting complete captive portal handler"
+  log.info "Starting iOS-focused captive portal handler"
   
-  // Precompute iOS success response
+  // This is the exact iOS success response content that's known to work
+  // From commit 5094ba88bedfeb902bd9b93042a64e5a30341e42 where iOS worked
   IOS_SUCCESS_BYTES := IOS_SUCCESS_RESPONSE.to_byte_array
-  
+   
   while true:
     log.debug "Waiting for connection..."
     client := socket.accept
@@ -186,70 +197,28 @@ direct_http_respond socket/tcp.ServerSocket access_points/List -> Map?:
     if client:
       log.info "Client connection established!"
       
-      // Read a bit of the request just to check for iOS detection or form submission
-      request_bytes := ByteArray 256
-      bytes_read := 0
-      read_exception := catch:
-        in := client.in
-        if in:
-          bytes := in.read --max-size=256
-          if bytes:
-            bytes_read = bytes.size
-            bytes.size.repeat: | i |
-              request_bytes[i] = bytes[i]
+      // Debug info
+      log.info "Connection received on HTTP server"
       
-      // Process the request if there's data
-      if bytes_read > 0:
-        request_str := ""
-        str_exception := catch:
-          request_str = request_bytes.to_string
-        
-        // Check for iOS detection
-        ios_detection := request_str.contains "hotspot-detect.html" or 
-                         request_str.contains "success.html" or
-                         request_str.contains "captive.apple.com"
-                        
-        if ios_detection:
-          log.info "iOS detection request"
-          write_exception := catch:
-            client.out.write IOS_SUCCESS_BYTES
-        
-        // Check for form submission
-        else if request_str.contains "POST" and request_str.contains "ssid=":
-          log.info "Form submission detected"
-          
-          credentials := parse_form_submission request_str
-          
-          if credentials and credentials.get "ssid" --if_absent=(: null):
-            log.info "Valid credentials extracted"
-            client.close
-            return credentials
-          
-          // Serve setup page for invalid credentials
-          serve_main_page client access_points
-        
-        // Serve setup page for all other requests
-        else:
-          log.info "Regular request - serving main page"
-          serve_main_page client access_points
+      // Send the iOS success response immediately and unconditionally
+      // For iOS devices, this will trigger the captive portal notification
+      // For Android and other devices, this gets them to load the main page
+      exception := catch:
+        client.out.write IOS_SUCCESS_BYTES
       
-      // For requests with no data, just serve the main page
-      else:
-        log.info "Empty request - serving main page"
+      // Always serve the main page for all other requests
+      exception = catch:
         serve_main_page client access_points
       
-      // Delay before closing
-      sleep --ms=500
+      // Long delay to ensure connection stability
+      sleep --ms=1000
       
-      // Close connection
-      close_exception := catch:
+      exception = catch:
         client.close
       
-      // Delay after closing
-      sleep --ms=100
+      sleep --ms=200
       
     else:
-      log.debug "No client - retry"
       sleep --ms=10
 
 // Helper to serve the main page
